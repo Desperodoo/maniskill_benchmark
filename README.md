@@ -71,7 +71,25 @@ rlft/
 
 ## 🚀 快速开始
 
+### 方式一：一键运行（推荐）
+
 我们提供了完整的自动化脚本，一键完成环境配置、数据下载、数据预处理和训练：
+
+```bash
+# 快速验证 (5000 步，验证全流程)
+bash scripts/run_full_pipeline.sh --quick
+
+# 完整训练 (4万步)
+bash scripts/run_full_pipeline.sh --full
+
+# 指定任务
+bash scripts/run_full_pipeline.sh --quick --task PickCube-v1
+
+# 跳过已完成的步骤
+bash scripts/run_full_pipeline.sh --full --skip-env --skip-download
+```
+
+### 方式二：分步运行
 
 #### Step 1: 配置环境
 
