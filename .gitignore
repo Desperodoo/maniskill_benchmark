@@ -12,7 +12,9 @@ node_modules/
 dist/
 build/
 *.log
-algorithm/__pycache__/
-algorithm/il/__pycache__/
-algorithm/offline_rl/__pycache__/
-algorithm/online_rl/__pycache__/
+rlft/algorithm/__pycache__/
+rlft/algorithm/il/__pycache__/
+rlft/algorithm/offline_rl/__pycache__/
+rlft/algorithm/online_rl/__pycache__/
+runs/
+wandb/
