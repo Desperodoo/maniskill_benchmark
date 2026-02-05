@@ -38,8 +38,8 @@ class FlowMatchingAgent(nn.Module):
         velocity_net: VelocityUNet1D,
         action_dim: int,
         obs_horizon: int = 2,
-        pred_horizon: int = 16,
-        num_flow_steps: int = 10,
+        pred_horizon: int = 8,  # Best from sweep (8 > 16)
+        num_flow_steps: int = 20,  # Best from sweep (20 > 10 > 5)
         action_bounds: Optional[tuple] = None,
         device: str = "cuda",
     ):

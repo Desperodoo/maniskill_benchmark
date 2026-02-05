@@ -48,8 +48,8 @@ class ShortCutFlowAgent(nn.Module):
         pred_horizon: int = 16,
         max_denoising_steps: int = 8,
         self_consistency_k: float = 0.25,  # Fraction of batch for consistency
-        flow_weight: float = 1.0,
-        shortcut_weight: float = 0.3,  # Sweep: flow-heavy is best
+        flow_weight: float = 1.0,  # Best from sweep: weights_1.0_1.0
+        shortcut_weight: float = 1.0,  # Best from sweep: equal weight
         ema_decay: float = 0.999,
         # Time sampling hyperparameters
         t_min: float = 0.0,
@@ -59,7 +59,7 @@ class ShortCutFlowAgent(nn.Module):
         step_size_mode: Literal["power2", "uniform", "fixed"] = "fixed",
         min_step_size: float = 0.0625,  # 1/16 by default
         max_step_size: float = 0.5,     # 1/2 by default
-        fixed_step_size: float = 0.0625, # 1/16 (sweep best)
+        fixed_step_size: float = 0.125,  # 1/8 (sweep best)
         # Target computation hyperparameters
         target_mode: Literal["velocity", "endpoint"] = "velocity",
         teacher_steps: int = 1,  # Sweep: single step preserves locality
