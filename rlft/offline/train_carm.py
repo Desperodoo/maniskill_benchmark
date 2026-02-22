@@ -45,7 +45,7 @@ from rlft.datasets import (
     CARMDataset, ActionNormalizer, 
     load_carm_dataset, create_carm_obs_process_fn, get_carm_data_info,
 )
-from rlft.datasets.data_utils import IterationBasedBatchSampler, worker_init_fn
+from rlft.datasets.data_utils import IterationBasedBatchSampler, worker_init_fn, encode_observations
 
 
 @dataclass
@@ -129,7 +129,7 @@ class Args:
     # Diffusion/Flow settings
     num_diffusion_iters: int = 100
     num_flow_steps: int = 20  # Best from sweep (20 > 10 > 5)
-    ema_decay: float = 0.999
+    ema_decay: float = 0.9995  # Best from wave3 (0.9995 > 0.999)
     bc_weight: float = 1.0
     consistency_weight: float = 0.3
     
@@ -149,8 +149,8 @@ class Args:
     """delta sampling strategy (fixed works best from sweep)"""
     cons_delta_min: float = 0.02
     cons_delta_max: float = 0.15
-    cons_delta_fixed: float = 0.02
-    """fixed delta (best from sweep)"""
+    cons_delta_fixed: float = 0.03
+    """fixed delta (best from wave3: 0.03)"""
     cons_delta_dynamic_max: bool = False
     cons_delta_cap: float = 0.99
     cons_teacher_steps: int = 2
@@ -172,7 +172,7 @@ class Args:
     """step size mode (fixed works best from sweep)"""
     sc_min_step_size: float = 0.0625
     sc_max_step_size: float = 0.5
-    sc_fixed_step_size: float = 0.125
+    sc_fixed_step_size: float = 0.15  # Best from wave3 (0.15 > 0.125)
     sc_target_mode: Literal["velocity", "endpoint"] = "velocity"
     sc_teacher_steps: int = 1
     sc_use_ema_teacher: bool = True
@@ -365,36 +365,22 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
 def save_ckpt(run_name, tag, agent, ema_agent, visual_encoder, state_encoder, 
               gripper_head, action_normalizer, optimizer=None, lr_scheduler=None,
               ema=None, iteration=None, args=None):
-    """Save checkpoint."""
-    os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
-    checkpoint = {
-        "agent": agent.state_dict(),
-        "ema_agent": ema_agent.state_dict() if ema_agent else None,
-        "visual_encoder": visual_encoder.state_dict() if visual_encoder else None,
-        "state_encoder": state_encoder.state_dict() if state_encoder else None,
-        "gripper_head": gripper_head.state_dict() if gripper_head else None,
-    }
-    if action_normalizer is not None and action_normalizer.stats is not None:
-        checkpoint["action_normalizer"] = {
-            "mode": action_normalizer.mode,
-            "stats": {k: v.tolist() for k, v in action_normalizer.stats.items()},
-        }
-    if optimizer is not None:
-        checkpoint["optimizer"] = optimizer.state_dict()
-    if lr_scheduler is not None:
-        checkpoint["lr_scheduler"] = lr_scheduler.state_dict()
-    if ema is not None:
-        checkpoint["ema"] = ema.state_dict()
-    if iteration is not None:
-        checkpoint["iteration"] = iteration
-    torch.save(checkpoint, f"runs/{run_name}/checkpoints/{tag}.pt")
-    
-    # Save args as JSON
-    if args is not None:
-        args_dict = vars(args)
-        args_serializable = {k: v if not isinstance(v, (list, tuple)) or not any(isinstance(x, type) for x in v) else str(v) for k, v in args_dict.items()}
-        with open(f"runs/{run_name}/checkpoints/args.json", 'w') as f:
-            json.dump(args_serializable, f, indent=2, default=str)
+    """Save checkpoint using shared utility."""
+    from rlft.utils.checkpoint import save_checkpoint
+    save_checkpoint(
+        path=f"runs/{run_name}/checkpoints/{tag}.pt",
+        agent=agent,
+        visual_encoder=visual_encoder,
+        ema_agent=ema_agent,
+        state_encoder=state_encoder,
+        gripper_head=gripper_head,
+        action_normalizer=action_normalizer,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        ema=ema,
+        iteration=iteration,
+        args=args,
+    )
 
 
 def main():
@@ -632,6 +618,16 @@ def main():
         else:
             print("  Skipped optimizer/scheduler state (resume_optimizer=False)")
         
+        # Load action normalizer stats
+        if action_normalizer is not None and "action_normalizer" in checkpoint:
+            saved_norm = checkpoint["action_normalizer"]
+            action_normalizer.mode = saved_norm["mode"]
+            action_normalizer.stats = {
+                k: np.array(v) if isinstance(v, list) else v
+                for k, v in saved_norm["stats"].items()
+            }
+            print("  Loaded action_normalizer stats")
+        
         # Get starting iteration
         if "iteration" in checkpoint:
             start_iter = checkpoint["iteration"] + 1
@@ -639,46 +635,17 @@ def main():
         
         print(f"Resume complete!")
     
-    def encode_observations(obs_seq):
-        """Encode observations to get obs_features.
-        
-        Handles RGB-only and RGBD modes:
-        - RGB: rgb / 255.0
-        - RGBD: concat(rgb / 255.0, depth / 1024.0)
-        """
-        B = obs_seq["state"].shape[0]
-        T = obs_seq["state"].shape[1]
-        
-        features_list = []
-        
-        # Visual features
-        rgb = obs_seq["rgb"]
-        rgb_flat = rgb.view(B * T, *rgb.shape[2:]).float() / 255.0
-        
-        if args.include_depth and "depth" in obs_seq:
-            # RGBD mode: concat RGB and depth
-            depth = obs_seq["depth"]
-            depth_flat = depth.view(B * T, *depth.shape[2:]).float() / 1024.0  # Normalize depth
-            visual_input = torch.cat([rgb_flat, depth_flat], dim=1)  # Concat along channel dim
-        else:
-            visual_input = rgb_flat
-        
-        visual_feat = visual_encoder(visual_input)
-        visual_feat = visual_feat.view(B, T, -1)
-        features_list.append(visual_feat)
-        
-        # State features
-        state = obs_seq["state"]
-        if state_encoder is not None:
-            state_flat = state.view(B * T, -1)
-            state_feat = state_encoder(state_flat)
-            state_feat = state_feat.view(B, T, -1)
-        else:
-            state_feat = state
-        features_list.append(state_feat)
-        
-        obs_features = torch.cat(features_list, dim=-1)
-        return obs_features
+    def _encode_obs(obs_seq):
+        """Thin wrapper around shared encode_observations."""
+        return encode_observations(
+            obs_seq=obs_seq,
+            visual_encoder=visual_encoder,
+            include_rgb=True,
+            device=device,
+            state_encoder=state_encoder,
+            include_depth=args.include_depth,
+            flatten=False,
+        )
     
     # Training loop
     agent.train()
@@ -687,14 +654,17 @@ def main():
     if state_encoder is not None:
         state_encoder.train()
     
-    pbar = tqdm(total=args.total_iters)
+    pbar = tqdm(total=args.total_iters, initial=start_iter)
     
     for iteration, data_batch in enumerate(train_dataloader):
+        iteration = iteration + start_iter
+        if iteration >= args.total_iters:
+            break
         obs_seq = data_batch["observations"]
         action_seq = data_batch["actions_cont"]  # Continuous actions without gripper
         gripper_labels = data_batch["gripper_label"]  # Discrete gripper labels
         
-        obs_features = encode_observations(obs_seq)
+        obs_features = _encode_obs(obs_seq)
         
         # Policy loss (continuous actions)
         loss_dict = agent.compute_loss(obs_features=obs_features, actions=action_seq)

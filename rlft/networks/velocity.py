@@ -134,7 +134,12 @@ class ShortCutVelocityUNet1D(nn.Module):
         Returns:
             velocity: (B, T, input_dim) predicted velocity
         """
-        # Get step size embedding (available for future extensions)
+        # Get step size embedding
+        # TODO: d_embed is computed but NOT actually passed to the UNet.
+        # ShortCut conditioning v(x_t, t, d) degrades to v(x_t, t) (regular Flow Matching).
+        # To fix: need to modify UNet to accept combined (t, d) embedding.
+        # WARNING: Existing pretrained checkpoints were trained with this bug,
+        # so fixing this requires retraining the offline model.
         d_embed = self.step_size_embed(step_size.unsqueeze(-1))
         
         # Flatten obs for global conditioning
@@ -166,19 +171,31 @@ class GripperHead(nn.Module):
         obs_dim: int,
         pred_horizon: int = 16,
         hidden_dim: int = 256,
+        use_layernorm: bool = True,
     ):
         super().__init__()
         self.pred_horizon = pred_horizon
-        
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, pred_horizon * 2),  # 2 classes per timestep
-        )
+        self.use_layernorm = use_layernorm
+
+        if use_layernorm:
+            self.net = nn.Sequential(
+                nn.Linear(obs_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.Mish(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.Mish(),
+                nn.Linear(hidden_dim, pred_horizon * 2),  # 2 classes per timestep
+            )
+        else:
+            # Legacy architecture (ReLU, no LayerNorm — matches older checkpoints)
+            self.net = nn.Sequential(
+                nn.Linear(obs_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, pred_horizon * 2),
+            )
     
     def forward(self, obs_features: torch.Tensor) -> torch.Tensor:
         """

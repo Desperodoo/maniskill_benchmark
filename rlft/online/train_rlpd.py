@@ -45,7 +45,7 @@ from rlft.algorithms.online_rl import SACAgent, AWSCAgent
 from rlft.buffers import OnlineReplayBuffer, OnlineReplayBufferRaw, SMDPChunkCollector, SuccessReplayBuffer
 from rlft.envs import make_eval_envs, evaluate
 from rlft.datasets import ManiSkillDataset, OfflineRLDataset, ActionNormalizer
-from rlft.datasets.data_utils import ObservationStacker
+from rlft.datasets.data_utils import ObservationStacker, encode_observations as _encode_observations_shared
 
 
 @dataclass
@@ -59,7 +59,7 @@ class Args:
     track: bool = True
     wandb_project_name: str = "RLPD"
     wandb_entity: Optional[str] = None
-    capture_video: bool = True
+    capture_video: bool = False
     """whether to capture videos of the agent performances"""
     
     # Algorithm selection
@@ -78,10 +78,14 @@ class Args:
     # Data settings
     demo_path: Optional[str] = "~/.maniskill/demos/LiftPegUpright-v1/rl/trajectory.rgb.pd_ee_delta_pose.physx_cuda.h5"
     num_demos: Optional[int] = None
-    online_ratio: float = 0.5
+    online_ratio: float = 0.15
+    """Fraction of online data in each batch. Sweep v3: or=0.15 best stability;
+    v4: confirmed as optimal for 250K-500K training. Lower ratio = stronger demo anchoring."""
     
     # Training settings
-    total_timesteps: int = 1_000_000
+    total_timesteps: int = 500_000
+    """Total environment steps. Sweep v4: 500K shows diminishing returns,
+    most configs plateau at 250K. 1M is unnecessarily long."""
     num_seed_steps: int = 5000
     utd_ratio: int = 20
     batch_size: int = 256
@@ -91,8 +95,11 @@ class Args:
     num_eval_episodes: int = 50
     
     # Optimizer settings
-    lr_actor: float = 3e-4
-    lr_critic: float = 3e-4
+    lr_actor: float = 1e-4
+    """Actor learning rate. Sweep v2: 3e-4 causes catastrophic forgetting;
+    v3/v4: 1e-4 optimal for 250K, 7e-5 for 500K. 1e-4 is safe default."""
+    lr_critic: float = 1e-4
+    """Critic learning rate. Should match lr_actor for AWSC."""
     lr_temp: float = 3e-4
     max_grad_norm: float = 10.0
     
@@ -111,8 +118,11 @@ class Args:
     
     # Policy settings
     obs_horizon: int = 2
-    act_horizon: int = 2
-    pred_horizon: int = 4
+    act_horizon: int = 8
+    """Action horizon (number of action steps fed to critic). Default 8 to match
+    offline pretrained checkpoints. Must align with pretrain checkpoint's critic
+    input_dim = obs_dim + action_dim * act_horizon."""
+    pred_horizon: int = 8
     
     # Visual encoder
     visual_feature_dim: int = 256
@@ -125,21 +135,23 @@ class Args:
     pretrain_path: Optional[str] = None
     """Path to pretrained ShortCut Flow or AW-ShortCut checkpoint for AWSC"""
     load_pretrain_critic: bool = False
-    """Whether to load critic from pretrain checkpoint"""
+    """Whether to load critic from pretrain checkpoint (recommended for AW-SC offline checkpoints)"""
     
     # AWSC hyperparameters (unified with old version)
-    awsc_beta: float = 100.0
-    """Temperature for advantage weighting in AWSC"""
-    awsc_bc_weight: float = 1.0
-    """Weight for flow matching loss"""
+    awsc_beta: float = 50.0
+    """Temperature for advantage weighting. Sweep v2-v4: beta=50 most robust.
+    Higher beta (80+) needs accurate Q-values and amplifies noise with low K."""
+    awsc_bc_weight: float = 2.0
+    """Weight for flow matching loss. Sweep v2: bc=2.0 critical for stability
+    by anchoring actor near pretrained policy."""
     awsc_shortcut_weight: float = 0.3
     """Weight for shortcut consistency loss"""
     awsc_self_consistency_k: float = 0.25
     """Fraction of batch for consistency loss (match IL/offline_rl)"""
-    awsc_ema_decay: float = 0.999
-    """EMA decay rate for velocity network"""
-    awsc_weight_clip: float = 100.0
-    """Maximum advantage weight to prevent outliers"""
+    awsc_ema_decay: float = 0.9995
+    """EMA decay rate for velocity network (best from wave3)"""
+    awsc_weight_clip: float = 200.0
+    """Maximum advantage weight to prevent outliers (best from wave3)"""
     awsc_exploration_noise_std: float = 0.1
     """Standard deviation of exploration noise"""
     awsc_num_inference_steps: int = 8
@@ -150,6 +162,30 @@ class Args:
     """Whether to filter policy training data by advantage"""
     awsc_advantage_threshold: float = -0.5
     """Minimum advantage for online samples in policy training"""
+    
+    # Advantage computation mode (AWSC)
+    awsc_advantage_mode: Literal["batch_mean", "per_state_v"] = "per_state_v"
+    """How to compute advantage baseline for Q-weighting:
+    - 'batch_mean': A(s,a) = Q(s,a) - mean(Q) over batch (fast, but state-independent)
+    - 'per_state_v': A(s,a) = Q(s,a) - V(s) where V(s) = E_{a'~π}[Q(s,a')]
+      (proper AWAC, distinguishes good/bad actions per state, costs extra forward passes)
+    Sweep v2-v4: per_state_v consistently superior with stable training (low LR + low OR)."""
+    awsc_num_v_samples: int = 4
+    """Number of policy samples to estimate V(s) for per_state_v mode"""
+    
+    # Actor policy training mode (AWSC)
+    actor_policy_mode: Literal["all", "success_only"] = "all"
+    """Data source for actor (policy) updates:
+    - 'all': Use full mixed batch (demo + online buffer), same as critic
+    - 'success_only': Use only demo + online success buffer for actor;
+      prevents policy from imitating failed rollout actions"""
+    success_criteria: Literal["success_once", "success_at_end"] = "success_once"
+    """How to determine if a transition is 'successful' for success_buffer:
+    - 'success_once': Mark as success if the agent succeeded at any point during
+      the episode (cumulative). Requires tracking per-env success_once state.
+    - 'success_at_end': Mark as success only if info['success'] is True at episode
+      termination (instantaneous). This is stricter and may result in zero successes
+      for tasks where the agent can't maintain success at the final step."""
     
     # ShortCut Flow U-Net settings (for AWSC, matches offline training)
     unet_down_dims: List[int] = field(default_factory=lambda: [64, 128, 256])
@@ -259,16 +295,33 @@ class AgentWrapper:
     def get_action(self, obs, deterministic=True, **kwargs):
         """Get action from agent.
         
+        Uses get_action() for full pred_horizon output, then applies temporal
+        offset slice [obs_horizon-1 : obs_horizon-1+act_horizon] to align with
+        training data (matching the offline evaluation convention).
+        
         Args:
             obs: Observation from eval_envs (already FrameStacked)
                  Shape: (B, T, state_dim) or dict with 'state' key
             deterministic: Whether to use deterministic action
         
         Returns:
-            actions: (B, pred_horizon, act_dim)
+            actions: (B, act_horizon, act_dim)
         """
         obs_cond = self.encode_obs(obs)
-        actions = self.agent.select_action(obs_cond, deterministic=deterministic)
+        
+        # For flow/diffusion agents (AWSC), use get_action() which returns the
+        # full pred_horizon sequence, then apply temporal offset slice
+        # [obs_horizon-1 : obs_horizon-1+act_horizon] to match offline eval.
+        # For other agents (e.g. SAC), use select_action() which already
+        # returns (B, act_horizon, action_dim) without offset.
+        if isinstance(self.agent, AWSCAgent):
+            actions_full = self.agent.get_action(obs_cond, deterministic=deterministic)
+            # Temporal offset slice: [obs_horizon-1 : obs_horizon-1+act_horizon]
+            start = self.obs_horizon - 1
+            end = start + self.act_horizon
+            actions = actions_full[:, start:end]
+        else:
+            actions = self.agent.select_action(obs_cond, deterministic=deterministic)
         
         # Denormalize actions if normalizer is provided
         if self.action_normalizer is not None:
@@ -319,6 +372,190 @@ def make_train_envs(args):
         env = FlattenRGBDObservationWrapper(env, rgb=True, depth=False, state=True)
     
     return env
+
+
+def validate_pretrained_checkpoint(
+    checkpoint_path: str,
+    args: "Args",
+    device: torch.device,
+    obs_dim: int = 0,
+    action_dim: int = 0,
+):
+    """Validate pretrained checkpoint architecture against current training config.
+    
+    Inspects weight tensor shapes to infer the checkpoint's architecture parameters
+    and compares them against the current args. Raises RuntimeError on mismatch.
+    
+    This catches silent failures where a pretrained model loads successfully
+    (Conv1d doesn't bind sequence length) but produces garbage outputs due to
+    mismatched pred_horizon, obs_dim, etc.
+    
+    Args:
+        checkpoint_path: Path to the pretrained checkpoint.
+        args: Current training arguments.
+        device: Torch device.
+        obs_dim: Computed obs_dim (obs_horizon * feature_dim) from current config.
+        action_dim: Environment action dimension.
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Get agent state dict (prefer ema_agent)
+    if "ema_agent" in checkpoint:
+        agent_state = checkpoint["ema_agent"]
+    elif "agent" in checkpoint:
+        agent_state = checkpoint["agent"]
+    else:
+        agent_state = checkpoint
+    
+    # Extract velocity_net weights (may have "velocity_net." prefix)
+    vnet_state = {}
+    for key, value in agent_state.items():
+        if key.startswith("velocity_net."):
+            vnet_state[key.replace("velocity_net.", "")] = value
+    
+    if not vnet_state:
+        print(f"  [Checkpoint Validation] No velocity_net weights found, skipping validation")
+        return
+    
+    # Determine UNet prefix (ShortCutVelocityUNet1D wraps UNet under "unet.")
+    unet_prefix = "unet." if any(k.startswith("unet.") for k in vnet_state) else ""
+    
+    errors = []
+    warnings = []
+    
+    # --- 1. Infer diffusion_step_embed_dim ---
+    dsed_key = f"{unet_prefix}diffusion_step_encoder.3.bias"
+    if dsed_key in vnet_state:
+        ckpt_dsed = vnet_state[dsed_key].shape[0]
+        if ckpt_dsed != args.diffusion_step_embed_dim:
+            errors.append(
+                f"diffusion_step_embed_dim: checkpoint={ckpt_dsed}, "
+                f"current={args.diffusion_step_embed_dim}. "
+                f"Fix: --diffusion_step_embed_dim {ckpt_dsed}"
+            )
+    
+    # --- 2. Infer action_dim (input_dim) ---
+    action_dim_key = f"{unet_prefix}final_conv.1.weight"
+    if action_dim_key in vnet_state:
+        ckpt_action_dim = vnet_state[action_dim_key].shape[0]
+        if action_dim > 0 and ckpt_action_dim != action_dim:
+            errors.append(
+                f"action_dim: checkpoint={ckpt_action_dim}, "
+                f"environment={action_dim}. "
+                f"The checkpoint was trained for a different action space."
+            )
+        else:
+            warnings.append(f"Checkpoint action_dim={ckpt_action_dim}")
+    
+    # --- 3. Infer global_cond_dim (obs_dim = obs_horizon * per_step_feature_dim) ---
+    cond_key = f"{unet_prefix}down_modules.0.0.cond_encoder.1.weight"
+    ckpt_obs_dim = None
+    if cond_key in vnet_state and dsed_key in vnet_state:
+        ckpt_cond_dim = vnet_state[cond_key].shape[1]
+        ckpt_dsed = vnet_state[dsed_key].shape[0]
+        ckpt_obs_dim = ckpt_cond_dim - ckpt_dsed
+        if obs_dim > 0 and ckpt_obs_dim != obs_dim:
+            errors.append(
+                f"obs_dim (global_cond_dim): checkpoint={ckpt_obs_dim}, "
+                f"current={obs_dim} (obs_horizon={args.obs_horizon} × feature_dim). "
+                f"This is likely an obs_horizon or visual_feature_dim mismatch. "
+                f"Fix: adjust --obs_horizon or --visual_feature_dim"
+            )
+        else:
+            warnings.append(f"Checkpoint obs_dim (global_cond_dim)={ckpt_obs_dim}")
+    
+    # --- 4. Infer down_dims ---
+    ckpt_down_dims = []
+    i = 0
+    while True:
+        dd_key = f"{unet_prefix}down_modules.{i}.0.blocks.0.block.0.weight"
+        if dd_key in vnet_state:
+            ckpt_down_dims.append(vnet_state[dd_key].shape[0])
+            i += 1
+        else:
+            break
+    
+    if ckpt_down_dims and tuple(ckpt_down_dims) != tuple(args.unet_down_dims):
+        errors.append(
+            f"unet_down_dims: checkpoint={tuple(ckpt_down_dims)}, "
+            f"current={tuple(args.unet_down_dims)}. "
+            f"Fix: --unet_down_dims {' '.join(str(d) for d in ckpt_down_dims)}"
+        )
+    
+    # --- 5. Infer kernel_size ---
+    ks_key = f"{unet_prefix}down_modules.0.0.blocks.0.block.0.weight"
+    if ks_key in vnet_state:
+        ckpt_kernel_size = vnet_state[ks_key].shape[2]
+        if ckpt_kernel_size != args.unet_kernel_size:
+            errors.append(
+                f"unet_kernel_size: checkpoint={ckpt_kernel_size}, "
+                f"current={args.unet_kernel_size}. "
+                f"Fix: --unet_kernel_size {ckpt_kernel_size}"
+            )
+    
+    # --- 6. Check config dict if saved in checkpoint ---
+    ckpt_config = checkpoint.get("config", None)
+    if ckpt_config is not None:
+        # Compare critical horizon parameters
+        for param in ["pred_horizon", "obs_horizon"]:
+            ckpt_val = ckpt_config.get(param)
+            curr_val = getattr(args, param)
+            if ckpt_val is not None and ckpt_val != curr_val:
+                errors.append(
+                    f"{param}: checkpoint={ckpt_val}, current={curr_val}. "
+                    f"Fix: --{param} {ckpt_val}"
+                )
+    
+    # --- 7. Validate critic dimensions (act_horizon must match for load_pretrain_critic) ---
+    if args.load_pretrain_critic:
+        critic_key = None
+        for key in agent_state:
+            if key.startswith("critic.q_nets.0.0.weight"):
+                critic_key = key
+                break
+        if critic_key is not None:
+            ckpt_critic_input_dim = agent_state[critic_key].shape[1]
+            expected_critic_input_dim = obs_dim + action_dim * args.act_horizon
+            if ckpt_critic_input_dim != expected_critic_input_dim:
+                ckpt_act_horizon = (ckpt_critic_input_dim - obs_dim) // action_dim
+                errors.append(
+                    f"critic input_dim: checkpoint={ckpt_critic_input_dim} "
+                    f"(act_horizon={ckpt_act_horizon}), "
+                    f"current={expected_critic_input_dim} "
+                    f"(act_horizon={args.act_horizon}). "
+                    f"Fix: --act_horizon {ckpt_act_horizon}"
+                )
+            else:
+                warnings.append(
+                    f"Critic input_dim={ckpt_critic_input_dim} matches "
+                    f"(act_horizon={args.act_horizon}) ✓"
+                )
+    
+    # --- Report ---
+    if warnings:
+        for w in warnings:
+            print(f"  [Checkpoint Info] {w}")
+    
+    if errors:
+        error_msg = (
+            f"\n{'=' * 60}\n"
+            f"PRETRAINED CHECKPOINT PARAMETER CONFLICT DETECTED\n"
+            f"{'=' * 60}\n"
+            f"Checkpoint: {checkpoint_path}\n\n"
+            f"The following parameters in the current config do NOT match\n"
+            f"the pretrained checkpoint's architecture. This will cause\n"
+            f"the model to produce incorrect outputs despite loading\n"
+            f"without errors.\n\n"
+        )
+        for i, e in enumerate(errors, 1):
+            error_msg += f"  {i}. {e}\n"
+        error_msg += (
+            f"\nPlease fix the parameters above or remove --pretrain_path.\n"
+            f"{'=' * 60}\n"
+        )
+        raise RuntimeError(error_msg)
+    
+    print(f"  [Checkpoint Validation] All architecture parameters match ✓")
 
 
 def main():
@@ -477,6 +714,8 @@ def main():
             exploration_noise_std=args.awsc_exploration_noise_std,
             filter_policy_data=args.awsc_filter_policy_data,
             advantage_threshold=args.awsc_advantage_threshold,
+            advantage_mode=args.awsc_advantage_mode,
+            num_v_samples=args.awsc_num_v_samples,
             device=device,
         ).to(device)
         use_temperature = False
@@ -484,6 +723,11 @@ def main():
         # Load pretrained checkpoint if provided
         if args.pretrain_path:
             print(f"Loading pretrained checkpoint from {args.pretrain_path}...")
+            
+            # Validate checkpoint architecture against current config BEFORE loading
+            validate_pretrained_checkpoint(args.pretrain_path, args, device,
+                                           obs_dim=obs_dim, action_dim=action_dim)
+            
             agent.load_pretrained(
                 args.pretrain_path,
                 load_critic=args.load_pretrain_critic,
@@ -503,6 +747,15 @@ def main():
             print(f"  - Advantage threshold: {args.awsc_advantage_threshold}")
             print(f"  - Policy uses: demos + high-advantage online samples")
             print(f"  - Critic uses: all data")
+        
+        # Print actor policy mode and advantage mode
+        print(f"Actor policy mode: {args.actor_policy_mode}")
+        if args.actor_policy_mode == "success_only":
+            print(f"  - Actor trains on: demo buffer + online success buffer only")
+            print(f"  - Critic trains on: all data (demo + full online buffer)")
+        print(f"Advantage mode: {args.awsc_advantage_mode}")
+        if args.awsc_advantage_mode == "per_state_v":
+            print(f"  - V(s) estimated with {args.awsc_num_v_samples} policy samples per state")
     else:
         raise ValueError(f"Unknown algorithm: {args.algorithm}")
     
@@ -543,8 +796,12 @@ def main():
     )
     
     # Success buffer (for storing successful online episodes)
+    # Auto-enable when actor_policy_mode requires it
     success_buffer = None
-    if args.use_success_buffer:
+    need_success_buffer = args.use_success_buffer or (
+        args.algorithm == "awsc" and args.actor_policy_mode == "success_only"
+    )
+    if need_success_buffer:
         success_buffer = SuccessReplayBuffer(
             capacity=args.success_buffer_capacity,
             num_envs=args.num_envs,
@@ -558,9 +815,39 @@ def main():
             device=device,
         )
         print(f"Success buffer enabled (capacity: {args.success_buffer_capacity})")
+        print(f"Success criteria: {args.success_criteria}")
+        if args.success_criteria == "success_once":
+            print("  - Transitions marked successful if agent succeeded at ANY point in episode")
+        else:
+            print("  - Transitions marked successful only if success=True at episode termination")
     
     # Create action normalizer if needed (for offline data)
-    action_normalizer = ActionNormalizer(mode=args.action_norm_mode) if args.normalize_actions else None
+    # When loading a pretrained model, check if it was trained with normalization.
+    # If the checkpoint has no action_normalizer, the model outputs raw actions;
+    # applying inverse_transform would corrupt them.
+    action_normalizer = None
+    if args.normalize_actions:
+        if args.pretrain_path:
+            pretrain_ckpt = torch.load(args.pretrain_path, map_location=device)
+            if "action_normalizer" in pretrain_ckpt and pretrain_ckpt["action_normalizer"] is not None:
+                # Load normalizer from pretrained checkpoint for consistency
+                normalizer_info = pretrain_ckpt["action_normalizer"]
+                action_normalizer = ActionNormalizer(mode=normalizer_info["mode"])
+                import numpy as _np
+                action_normalizer.stats = {
+                    k: _np.array(v) if isinstance(v, list) else v
+                    for k, v in normalizer_info["stats"].items()
+                }
+                print(f"Loaded action normalizer from pretrained checkpoint (mode={normalizer_info['mode']})")
+            else:
+                # Pretrained model was trained WITHOUT normalization
+                print(f"WARNING: Pretrained checkpoint has no action_normalizer.")
+                print(f"  Disabling action normalization to match pretrained model.")
+                print(f"  (The model outputs raw actions; denormalizing would corrupt them.)")
+                args.normalize_actions = False
+            del pretrain_ckpt
+        else:
+            action_normalizer = ActionNormalizer(mode=args.action_norm_mode)
     
     # Offline dataset for RLPD (use OfflineRLDataset for SMDP formulation)
     offline_dataset = None
@@ -633,28 +920,12 @@ def main():
     obs_stacker.reset(obs)
     
     def encode_observations(stacked_obs):
-        B = stacked_obs["state"].shape[0]
-        T = stacked_obs["state"].shape[1]
-        features = []
-        
-        if include_rgb and visual_encoder is not None:
-            rgb = stacked_obs["rgb"]
-            if isinstance(rgb, np.ndarray):
-                rgb = torch.from_numpy(rgb).to(device)
-            rgb = rgb.contiguous()  # Ensure contiguous memory layout
-            rgb_flat = rgb.reshape(B * T, *rgb.shape[2:]).float() / 255.0
-            if rgb_flat.ndim == 4 and rgb_flat.shape[-1] == 3:
-                rgb_flat = rgb_flat.permute(0, 3, 1, 2).contiguous()
-            visual_feat = visual_encoder(rgb_flat)
-            visual_feat = visual_feat.view(B, T, -1)
-            features.append(visual_feat)
-        
-        state = stacked_obs["state"]
-        if isinstance(state, np.ndarray):
-            state = torch.from_numpy(state).to(device)
-        features.append(state)
-        
-        return torch.cat(features, dim=-1).reshape(B, -1)
+        return _encode_observations_shared(
+            obs_seq=stacked_obs,
+            visual_encoder=visual_encoder,
+            include_rgb=include_rgb,
+            device=device,
+        )
     
     total_steps = 0
     last_eval_step = -args.eval_freq  # Track last eval to handle non-exact intervals
@@ -662,6 +933,10 @@ def main():
     episode_lengths = defaultdict(int)
     episode_successes = []
     best_success_rate = 0.0
+    
+    # Per-env success_once tracking: accumulates success across steps within an episode
+    # Reset on episode done. Used when success_criteria='success_once'.
+    episode_has_succeeded = np.zeros(args.num_envs, dtype=np.float32)
     
     chunk_collector = SMDPChunkCollector(
         num_envs=args.num_envs,
@@ -694,6 +969,7 @@ def main():
         chunk_collector.reset()
         chunk_rewards = []
         chunk_dones = []
+        chunk_success_per_env = np.zeros(args.num_envs, dtype=np.float32)
         
         first_obs_raw = obs_stacker.get_stacked()
         first_obs_raw_np = {
@@ -718,11 +994,27 @@ def main():
                 episode_rewards[env_idx] += reward_np[env_idx]
                 episode_lengths[env_idx] += 1
                 
+                # Track per-step success for success_once accumulation
+                step_success = info.get("success", [False] * args.num_envs)[env_idx]
+                if hasattr(step_success, "item"):
+                    step_success = step_success.item()
+                episode_has_succeeded[env_idx] = max(episode_has_succeeded[env_idx], float(step_success))
+                
                 if done_np[env_idx]:
-                    success = info.get("success", [False] * args.num_envs)[env_idx]
-                    if hasattr(success, "item"):
-                        success = success.item()
-                    episode_successes.append(float(success))
+                    episode_successes.append(float(step_success))
+                    # Track success per env for this chunk (for success buffer)
+                    if args.success_criteria == "success_once":
+                        # Use accumulated success: True if agent succeeded at any point
+                        chunk_success_per_env[env_idx] = max(
+                            chunk_success_per_env[env_idx], episode_has_succeeded[env_idx]
+                        )
+                    else:
+                        # Use instantaneous success at termination
+                        chunk_success_per_env[env_idx] = max(
+                            chunk_success_per_env[env_idx], float(step_success)
+                        )
+                    # Reset per-env success_once tracker on episode boundary
+                    episode_has_succeeded[env_idx] = 0.0
                     episode_rewards[env_idx] = 0.0
                     episode_lengths[env_idx] = 0
             
@@ -750,6 +1042,21 @@ def main():
             discount_factor=discount_factor,
             effective_length=effective_length,
         )
+        
+        # Store successful transitions in success buffer (for actor_policy_mode="success_only")
+        if success_buffer is not None:
+            success_buffer.store(
+                obs=first_obs_raw_np,
+                action=action_chunk,
+                reward=chunk_rewards[0],
+                next_obs=next_obs_raw_np,
+                done=np.any(np.stack(chunk_dones, axis=0), axis=0).astype(np.float32),
+                cumulative_reward=cumulative_reward,
+                chunk_done=chunk_done,
+                discount_factor=discount_factor,
+                effective_length=effective_length,
+                success=chunk_success_per_env,
+            )
         
         # Training updates
         if total_steps >= args.num_seed_steps and online_buffer.size >= args.batch_size:
@@ -811,7 +1118,28 @@ def main():
                     training_metrics[f"critic/{k}"].append(v.item() if torch.is_tensor(v) else v)
                 
                 # Re-encode for actor update (need fresh computation graph)
-                obs_features_actor = encode_observations(batch["observations"])
+                # In "success_only" mode, sample a separate batch for actor from
+                # success_buffer + offline_dataset (no failed transitions).
+                # In "all" mode, reuse the same batch as critic.
+                use_success_batch = (
+                    args.algorithm == "awsc"
+                    and args.actor_policy_mode == "success_only"
+                    and success_buffer is not None
+                    and success_buffer.size > 0
+                )
+                
+                if use_success_batch:
+                    actor_batch = success_buffer.sample_mixed(
+                        batch_size=args.batch_size,
+                        offline_dataset=offline_dataset,
+                        online_ratio=args.online_ratio if offline_dataset else 1.0,
+                        policy_mode=True,
+                        success_only=True,
+                    )
+                    obs_features_actor = encode_observations(actor_batch["observations"])
+                else:
+                    actor_batch = batch
+                    obs_features_actor = encode_observations(batch["observations"])
                 
                 # Update actor - algorithm-specific
                 actor_optimizer.zero_grad()
@@ -821,9 +1149,9 @@ def main():
                     # AWSC needs actions and is_demo for advantage-weighted loss
                     actor_loss, actor_metrics = agent.compute_actor_loss(
                         obs_features_actor,
-                        batch["actions"],
-                        batch["actions"][:, :args.act_horizon],
-                        batch.get("is_demo"),  # May be None if not tracked
+                        actor_batch["actions"],
+                        actor_batch["actions"][:, :args.act_horizon],
+                        actor_batch.get("is_demo"),  # May be None if not tracked
                     )
                 actor_loss.backward()
                 nn.utils.clip_grad_norm_(actor_params, args.max_grad_norm)
@@ -872,12 +1200,21 @@ def main():
             if training_metrics:
                 for metric_name, values in training_metrics.items():
                     if values:
+                        # Skip string metrics (like advantage_mode)
+                        if isinstance(values[0], str):
+                            continue
                         avg_value = np.mean(values)
                         writer.add_scalar(f"train/{metric_name}", avg_value, total_steps)
                         log_dict[f"train/{metric_name}"] = avg_value
                 
                 # Clear metrics after logging
                 training_metrics.clear()
+            
+            # Log success buffer statistics
+            if success_buffer is not None:
+                sb_stats = success_buffer.get_statistics()
+                for k, v in sb_stats.items():
+                    log_dict[f"train/success_buffer/{k}"] = v
             
             if args.track:
                 wandb.log(log_dict, step=total_steps)
@@ -908,35 +1245,33 @@ def main():
             
             if eval_metrics.get("success_once", 0) > best_success_rate:
                 best_success_rate = eval_metrics["success_once"]
-                checkpoint = {
-                    "agent": agent.state_dict(),
-                    "visual_encoder": visual_encoder.state_dict() if visual_encoder else None,
-                    "config": vars(args),
-                }
-                if action_normalizer is not None and action_normalizer.stats is not None:
-                    checkpoint["action_normalizer"] = {
-                        "mode": action_normalizer.mode,
-                        "stats": {k: v.tolist() for k, v in action_normalizer.stats.items()},
-                    }
-                torch.save(checkpoint, f"{log_dir}/checkpoints/best.pt")
+                from rlft.utils.checkpoint import save_checkpoint as _save_ckpt
+                _save_ckpt(
+                    path=f"{log_dir}/checkpoints/best.pt",
+                    agent=agent,
+                    visual_encoder=visual_encoder,
+                    action_normalizer=action_normalizer,
+                    args=args,
+                    save_args_json=False,
+                )
                 print(f"  New best! Saved checkpoint.")
         
         # Save checkpoint
         if total_steps % args.save_freq == 0:
-            checkpoint = {
-                "agent": agent.state_dict(),
-                "visual_encoder": visual_encoder.state_dict() if visual_encoder else None,
-                "actor_optimizer": actor_optimizer.state_dict(),
-                "critic_optimizer": critic_optimizer.state_dict(),
-                "total_steps": total_steps,
-                "config": vars(args),
-            }
-            if action_normalizer is not None and action_normalizer.stats is not None:
-                checkpoint["action_normalizer"] = {
-                    "mode": action_normalizer.mode,
-                    "stats": {k: v.tolist() for k, v in action_normalizer.stats.items()},
-                }
-            torch.save(checkpoint, f"{log_dir}/checkpoints/step_{total_steps}.pt")
+            from rlft.utils.checkpoint import save_checkpoint as _save_ckpt
+            _save_ckpt(
+                path=f"{log_dir}/checkpoints/step_{total_steps}.pt",
+                agent=agent,
+                visual_encoder=visual_encoder,
+                action_normalizer=action_normalizer,
+                args=args,
+                save_args_json=False,
+                extra={
+                    "actor_optimizer": actor_optimizer.state_dict(),
+                    "critic_optimizer": critic_optimizer.state_dict(),
+                },
+                total_steps=total_steps,
+            )
         
         pbar.set_postfix({
             "success": f"{np.mean(episode_successes[-100:]) if episode_successes else 0:.2%}",
@@ -946,17 +1281,15 @@ def main():
     pbar.close()
     
     # Final save
-    checkpoint = {
-        "agent": agent.state_dict(),
-        "visual_encoder": visual_encoder.state_dict() if visual_encoder else None,
-        "config": vars(args),
-    }
-    if action_normalizer is not None and action_normalizer.stats is not None:
-        checkpoint["action_normalizer"] = {
-            "mode": action_normalizer.mode,
-            "stats": {k: v.tolist() for k, v in action_normalizer.stats.items()},
-        }
-    torch.save(checkpoint, f"{log_dir}/checkpoints/final.pt")
+    from rlft.utils.checkpoint import save_checkpoint as _save_ckpt
+    _save_ckpt(
+        path=f"{log_dir}/checkpoints/final.pt",
+        agent=agent,
+        visual_encoder=visual_encoder,
+        action_normalizer=action_normalizer,
+        args=args,
+        save_args_json=False,
+    )
     
     train_envs.close()
     eval_envs.close()

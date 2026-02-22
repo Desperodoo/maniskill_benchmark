@@ -45,9 +45,11 @@ from rlft.algorithms import (
     DiffusionPolicyAgent, FlowMatchingAgent, ShortCutFlowAgent,
     ConsistencyFlowAgent, ReflectedFlowAgent,
     CPQLAgent, AWCPAgent, AWShortCutFlowAgent,
+    OfflineSACAgent, DQCAgent,
 )
+from rlft.networks import SigmoidQNetwork
 from rlft.datasets import OfflineRLDataset, IterationBasedBatchSampler, worker_init_fn, ActionNormalizer
-from rlft.datasets.data_utils import build_state_obs_extractor, create_obs_process_fn
+from rlft.datasets.data_utils import build_state_obs_extractor, create_obs_process_fn, encode_observations as _encode_observations_shared
 
 
 @dataclass
@@ -61,7 +63,7 @@ class Args:
     track: bool = True
     wandb_project_name: str = "ManiSkill"
     wandb_entity: Optional[str] = None
-    capture_video: bool = True
+    capture_video: bool = False
 
     # Environment settings
     env_id: str = "LiftPegUpright-v1"
@@ -90,13 +92,13 @@ class Args:
     # Algorithm selection
     algorithm: Literal[
         "diffusion_policy", "flow_matching", "consistency_flow", "reflected_flow", "shortcut_flow",
-        "cpql", "awcp", "aw_shortcut_flow",
+        "cpql", "awcp", "aw_shortcut_flow", "sac", "dqc",
     ] = "flow_matching"
     
     # Diffusion/Flow settings
     num_diffusion_iters: int = 100  # Diffusion policy iterations
     num_flow_steps: int = 20  # Best from sweep (20 > 10 > 5)
-    ema_decay: float = 0.999
+    ema_decay: float = 0.9995  # Best from wave3 (0.9995 > 0.999)
     
     # Reflected Flow settings
     reflection_mode: Literal["hard", "soft"] = "soft"  # Best from sweep
@@ -120,8 +122,8 @@ class Args:
     """minimum delta when using random delta"""
     cons_delta_max: float = 0.15
     """maximum delta when using random delta"""
-    cons_delta_fixed: float = 0.04
-    """fixed delta when cons_delta_mode=fixed (best from sweep)"""
+    cons_delta_fixed: float = 0.03
+    """fixed delta when cons_delta_mode=fixed (best from wave3: 0.03)"""
     cons_delta_dynamic_max: bool = False
     """cap random delta by remaining time"""
     cons_delta_cap: float = 0.99
@@ -136,7 +138,7 @@ class Args:
     """consistency loss space: velocity or endpoint"""
 
     # ShortCut Flow settings
-    sc_fixed_step_size: float = 0.125
+    sc_fixed_step_size: float = 0.15  # Best from wave3 (0.15 > 0.125)
     sc_num_inference_steps: int = 8
     """number of inference steps (best from sweep)"""
     sc_max_denoising_steps: int = 8
@@ -168,22 +170,66 @@ class Args:
     bc_weight: float = 0.5  # Best from sweep for cpql
     consistency_weight: float = 0.3
     """consistency regularization weight (best from sweep)"""
-    alpha: float = 0.001
-    """CPQL entropy coefficient (best from sweep: 0.001)"""
+    alpha: float = 0.0005
+    """CPQL entropy coefficient (best from wave3: 0.0005)"""
     beta: float = 10.0
     """AWR temperature (best from sweep: 10.0 for aggressive config)"""
     gamma: float = 0.99
     tau: float = 0.005
-    reward_scale: float = 0.1
-    """reward scaling factor (best from sweep)"""
+    reward_scale: float = 0.05
+    """reward scaling factor (best from wave3: 0.05)"""
     q_target_clip: float = 100.0
-    weight_clip: float = 100.0
+    weight_clip: float = 200.0  # Best from wave3 (200 > 100)
+    
+    # SAC-specific settings (only used when algorithm="sac")
+    sac_reward_scale: float = 1.0
+    """Reward scale for SAC (overrides reward_scale when algorithm=sac)"""
+    init_temperature: float = 1.0
+    """Initial entropy temperature for SAC"""
+    lr_temperature: float = 1e-4
+    """Learning rate for temperature optimizer (lower than actor/critic to prevent alpha collapse)"""
+    target_entropy: Optional[float] = None
+    """Target entropy for SAC temperature tuning (default: -action_dim * act_horizon)"""
+    backup_entropy: bool = False
+    """Whether to subtract entropy in Q-target for SAC"""
+    actor_q_mode: Literal["min", "mean"] = "min"
+    """Q aggregation mode for actor loss: 'min' (pessimistic) or 'mean'"""
+    
+    # --- Regularization method (the key axis for offline SAC) ---
+    actor_loss_type: Literal["sac", "td3bc", "awr", "iql"] = "td3bc"
+    """Actor loss type: 'sac'=pure, 'td3bc'=BC+Q, 'awr'=advantage-weighted, 'iql'=IQL"""
+    actor_bc_weight: float = 2.0
+    """BC weight for td3bc mode. lam=1/(1+w). 0=pure SAC within td3bc."""
+    cql_alpha: float = 0.0
+    """CQL conservative penalty weight on critic. 0=disabled, >0=penalize OOD Q."""
+    awr_temperature: float = 1.0
+    """Temperature β for AWR/IQL advantage weighting. Lower=more selective."""
+    iql_expectile: float = 0.7
+    """Expectile τ for IQL value regression (0.5-1.0). Higher=more optimistic V."""
+    lr_value: float = 3e-4
+    """Learning rate for IQL value network optimizer."""
     
     # Ensemble Q settings
     use_ensemble_q: bool = True
     num_qs: int = 10
     num_min_qs: int = 2
     q_hidden_dims: List[int] = field(default_factory=lambda: [256, 256, 256])
+    
+    # DQC-specific settings
+    backup_horizon: int = 16
+    """Chunk critic horizon h (DQC). Should be <= pred_horizon to avoid dataset changes."""
+    kappa_b: float = 0.9
+    """Backup expectile for V-network (DQC). Higher = more optimistic V."""
+    kappa_d: float = 0.8
+    """Distillation expectile for action critic (DQC). Higher = track upper quantiles."""
+    best_of_n: int = 32
+    """Number of candidates for best-of-N inference (DQC). Higher = better but slower."""
+    num_chunk_qs: int = 2
+    """Number of Q-networks in DQC chunk critic ensemble."""
+    num_action_qs: int = 2
+    """Number of Q-networks in DQC action critic ensemble."""
+    dqc_reward_scale: float = 1.0
+    """Reward scale for DQC Bellman target."""
     
     # Action normalization settings
     normalize_actions: bool = False
@@ -549,25 +595,83 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
             device=device,
         )
     
+    elif algorithm == "sac":
+        # SAC uses its own reward_scale (default 1.0) — alpha handles the balance
+        sac_rs = args.sac_reward_scale
+        return OfflineSACAgent(
+            obs_dim=global_cond_dim,
+            action_dim=action_dim,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            act_horizon=args.act_horizon,
+            hidden_dims=args.q_hidden_dims,
+            num_qs=args.num_qs,
+            num_min_qs=args.num_min_qs,
+            gamma=args.gamma,
+            tau=args.tau,
+            init_temperature=args.init_temperature,
+            target_entropy=args.target_entropy,
+            backup_entropy=args.backup_entropy,
+            reward_scale=sac_rs,
+            q_target_clip=args.q_target_clip,
+            actor_q_mode=args.actor_q_mode,
+            actor_loss_type=args.actor_loss_type,
+            actor_bc_weight=args.actor_bc_weight,
+            cql_alpha=args.cql_alpha,
+            awr_temperature=args.awr_temperature,
+            iql_expectile=args.iql_expectile,
+            action_bounds=args.action_bounds,
+            device=device,
+        )
+    
+    elif algorithm == "dqc":
+        velocity_net = VelocityUNet1D(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=tuple(args.unet_dims),
+            n_groups=args.n_groups,
+        )
+        return DQCAgent(
+            velocity_net=velocity_net,
+            action_dim=action_dim,
+            obs_dim=global_cond_dim,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            act_horizon=args.act_horizon,
+            backup_horizon=args.backup_horizon,
+            num_flow_steps=args.num_flow_steps,
+            q_hidden_dims=args.q_hidden_dims,
+            num_chunk_qs=args.num_chunk_qs,
+            num_action_qs=args.num_action_qs,
+            kappa_b=args.kappa_b,
+            kappa_d=args.kappa_d,
+            gamma=args.gamma,
+            tau=args.tau,
+            ema_decay=args.ema_decay,
+            reward_scale=args.dqc_reward_scale,
+            q_target_clip=args.q_target_clip,
+            best_of_n=args.best_of_n,
+            action_bounds=args.action_bounds,
+            device=device,
+        )
+    
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
 
 
-def save_ckpt(run_name, tag, agent, ema_agent, visual_encoder, action_normalizer=None):
-    """Save checkpoint."""
-    os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
-    checkpoint = {
-        "agent": agent.state_dict(),
-        "ema_agent": ema_agent.state_dict() if ema_agent else None,
-    }
-    if visual_encoder is not None:
-        checkpoint["visual_encoder"] = visual_encoder.state_dict()
-    if action_normalizer is not None and action_normalizer.stats is not None:
-        checkpoint["action_normalizer"] = {
-            "mode": action_normalizer.mode,
-            "stats": {k: v.tolist() for k, v in action_normalizer.stats.items()},
-        }
-    torch.save(checkpoint, f"runs/{run_name}/checkpoints/{tag}.pt")
+def save_ckpt(run_name, tag, agent, ema_agent, visual_encoder, action_normalizer=None, args=None):
+    """Save checkpoint using shared utility."""
+    from rlft.utils.checkpoint import save_checkpoint
+    save_checkpoint(
+        path=f"runs/{run_name}/checkpoints/{tag}.pt",
+        agent=agent,
+        visual_encoder=visual_encoder,
+        ema_agent=ema_agent,
+        action_normalizer=action_normalizer,
+        args=args,
+        save_args_json=False,
+    )
 
 
 def main():
@@ -789,18 +893,75 @@ def main():
     )
     
     # Set up optimizer
-    if visual_encoder is not None:
-        params = list(agent.parameters()) + list(visual_encoder.parameters())
+    if args.algorithm == "sac":
+        # SAC uses separate optimizers for actor, critic, temperature
+        # For AWR/IQL modes, actor learns from log-prob (no reparameterization),
+        # so visual_encoder params go with actor_optimizer regardless of mode.
+        actor_params = list(agent.actor.parameters())
+        if visual_encoder is not None:
+            actor_params += list(visual_encoder.parameters())
+        
+        actor_optimizer = optim.AdamW(actor_params, lr=args.lr)
+        critic_optimizer = optim.AdamW(agent.critic.parameters(), lr=args.lr_critic)
+        temp_optimizer = optim.AdamW(agent.temperature.parameters(), lr=args.lr_temperature)
+        
+        # IQL: additional value network optimizer
+        value_optimizer = None
+        if agent.has_value_network:
+            value_optimizer = optim.AdamW(agent.value_net.parameters(), lr=args.lr_value)
+        
+        actor_lr_scheduler = get_scheduler(
+            name="cosine",
+            optimizer=actor_optimizer,
+            num_warmup_steps=500,
+            num_training_steps=args.total_iters,
+        )
+        critic_lr_scheduler = get_scheduler(
+            name="cosine",
+            optimizer=critic_optimizer,
+            num_warmup_steps=500,
+            num_training_steps=args.total_iters,
+        )
+        optimizer = None  # Not used for SAC
+        lr_scheduler = None
+    elif args.algorithm == "dqc":
+        # DQC uses 4 separate optimizers: actor, chunk_critic, action_critic, value
+        actor_params = list(agent.velocity_net.parameters())
+        if visual_encoder is not None:
+            actor_params += list(visual_encoder.parameters())
+        
+        actor_optimizer = optim.AdamW(actor_params, lr=args.lr)
+        chunk_critic_optimizer = optim.AdamW(agent.chunk_critic.parameters(), lr=args.lr_critic)
+        action_critic_optimizer = optim.AdamW(agent.action_critic.parameters(), lr=args.lr_critic)
+        value_optimizer = optim.AdamW(agent.value_net.parameters(), lr=args.lr_value)
+        
+        actor_lr_scheduler = get_scheduler(
+            name="cosine",
+            optimizer=actor_optimizer,
+            num_warmup_steps=500,
+            num_training_steps=args.total_iters,
+        )
+        critic_lr_scheduler = get_scheduler(
+            name="cosine",
+            optimizer=chunk_critic_optimizer,
+            num_warmup_steps=500,
+            num_training_steps=args.total_iters,
+        )
+        optimizer = None
+        lr_scheduler = None
     else:
-        params = list(agent.parameters())
-    
-    optimizer = optim.AdamW(params, lr=args.lr)
-    lr_scheduler = get_scheduler(
-        name="cosine",
-        optimizer=optimizer,
-        num_warmup_steps=500,
-        num_training_steps=args.total_iters,
-    )
+        if visual_encoder is not None:
+            params = list(agent.parameters()) + list(visual_encoder.parameters())
+        else:
+            params = list(agent.parameters())
+        
+        optimizer = optim.AdamW(params, lr=args.lr)
+        lr_scheduler = get_scheduler(
+            name="cosine",
+            optimizer=optimizer,
+            num_warmup_steps=500,
+            num_training_steps=args.total_iters,
+        )
     
     # EMA
     ema = EMAModel(parameters=agent.parameters(), power=0.75)
@@ -818,38 +979,15 @@ def main():
     best_eval_metrics = defaultdict(float)
     
     def encode_observations(obs_seq):
-        """Encode observations to get obs_features.
-        
-        Handles RGB-only and RGBD modes:
-        - RGB: rgb / 255.0
-        - RGBD: concat(rgb / 255.0, depth / 1024.0)
-        """
-        B = obs_seq["state"].shape[0]
-        T = obs_seq["state"].shape[1]
-        
-        features_list = []
-        
-        if visual_encoder is not None and "rgb" in obs_seq:
-            rgb = obs_seq["rgb"]
-            rgb_flat = rgb.view(B * T, *rgb.shape[2:]).float() / 255.0
-            
-            # If depth is available, concatenate it
-            if include_depth and "depth" in obs_seq:
-                depth = obs_seq["depth"]
-                depth_flat = depth.view(B * T, *depth.shape[2:]).float() / 1024.0
-                visual_input = torch.cat([rgb_flat, depth_flat], dim=1)  # Concat along channel dim
-            else:
-                visual_input = rgb_flat
-            
-            visual_feat = visual_encoder(visual_input)
-            visual_feat = visual_feat.view(B, T, -1)
-            features_list.append(visual_feat)
-        
-        state = obs_seq["state"]
-        features_list.append(state)
-        
-        obs_features = torch.cat(features_list, dim=-1)
-        return obs_features
+        """Thin wrapper around shared encode_observations."""
+        return _encode_observations_shared(
+            obs_seq=obs_seq,
+            visual_encoder=visual_encoder,
+            include_rgb=True,
+            device=device,
+            include_depth=include_depth,
+            flatten=False,
+        )
     
     # Training loop
     agent.train()
@@ -889,31 +1027,169 @@ def main():
             
             next_obs_features = encode_observations(next_obs_seq)
             
-            loss_dict = agent.compute_loss(
-                obs_features=obs_features,
-                actions=action_seq,
-                rewards=rewards,
-                next_obs_features=next_obs_features,
-                dones=dones,
-                actions_for_q=actions_for_q,
-                cumulative_reward=cumulative_reward,
-                chunk_done=chunk_done,
-                discount_factor=discount_factor,
-            )
-            
-            total_loss = loss_dict["loss"]
-            
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
-            if visual_encoder is not None:
-                torch.nn.utils.clip_grad_norm_(visual_encoder.parameters(), 1.0)
-            optimizer.step()
-            lr_scheduler.step()
-            
-            agent.update_target()
-            if hasattr(agent, "update_ema"):
-                agent.update_ema()
+            if args.algorithm == "sac":
+                # SAC: separate backward passes for critic, (value), actor, temperature
+                #
+                # The training order depends on actor_loss_type:
+                #   - sac/td3bc (reparameterization): need ∂Q/∂a → freeze critic during actor backward
+                #   - awr/iql (advantage-weighted log-prob): no ∂Q/∂a, no critic freeze needed
+                #   - iql additionally: train V-network with expectile regression
+                obs_cond = obs_features.reshape(obs_features.shape[0], -1) if obs_features.dim() == 3 else obs_features
+                next_obs_cond = next_obs_features.reshape(next_obs_features.shape[0], -1) if next_obs_features.dim() == 3 else next_obs_features
+                
+                # --- IQL Value Network update (before critic, uses target Q) ---
+                value_loss = torch.tensor(0.0, device=device)
+                value_metrics = {}
+                if agent.has_value_network and value_optimizer is not None:
+                    value_optimizer.zero_grad()
+                    value_loss, value_metrics = agent._compute_value_loss(
+                        obs_cond.detach(), actions_for_q)
+                    value_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(agent.value_net.parameters(), 1.0)
+                    value_optimizer.step()
+                
+                # --- Critic update ---
+                critic_optimizer.zero_grad()
+                critic_loss, critic_metrics = agent._compute_critic_loss(
+                    obs_cond.detach(), actions_for_q, next_obs_cond.detach(),
+                    rewards, dones,
+                    cumulative_reward, chunk_done, discount_factor,
+                )
+                critic_loss.backward()
+                torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 1.0)
+                critic_optimizer.step()
+                critic_lr_scheduler.step()
+                
+                # --- Actor update ---
+                # For reparameterization modes (sac/td3bc): freeze critic params
+                # to prevent critic graph from being freed during actor backward.
+                # For non-reparam modes (awr/iql): no freeze needed — actor loss
+                # uses data actions + detached advantages, no ∂Q/∂a gradient.
+                actor_optimizer.zero_grad()
+                if agent.uses_reparameterization:
+                    for p in agent.critic.parameters():
+                        p.requires_grad_(False)
+                
+                actor_loss, actor_metrics = agent._compute_actor_loss(
+                    obs_cond, data_actions=actions_for_q)
+                actor_loss.backward()
+                
+                if agent.uses_reparameterization:
+                    for p in agent.critic.parameters():
+                        p.requires_grad_(True)
+                torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), 1.0)
+                if visual_encoder is not None:
+                    torch.nn.utils.clip_grad_norm_(visual_encoder.parameters(), 1.0)
+                actor_optimizer.step()
+                actor_lr_scheduler.step()
+                
+                # --- Temperature update ---
+                temp_optimizer.zero_grad()
+                temp_loss, temp_metrics = agent._compute_temperature_loss(obs_cond.detach())
+                temp_loss.backward()
+                temp_optimizer.step()
+                
+                # --- Target network soft update (critic + IQL value) ---
+                agent.update_target()
+                
+                # Build loss_dict for logging
+                loss_dict = {
+                    "loss": (critic_loss + actor_loss + temp_loss + value_loss).detach(),
+                    "actor_loss": actor_loss.detach(),
+                    "critic_loss": critic_loss.detach(),
+                    "temperature_loss": temp_loss.detach(),
+                    "value_loss": value_loss.detach() if isinstance(value_loss, torch.Tensor) else value_loss,
+                }
+                loss_dict.update(critic_metrics)
+                loss_dict.update(actor_metrics)
+                loss_dict.update(temp_metrics)
+                loss_dict.update(value_metrics)
+            elif args.algorithm == "dqc":
+                # DQC: 4 separate backward passes — value, chunk_critic, action_critic, actor
+                obs_cond = obs_features.reshape(obs_features.shape[0], -1) if obs_features.dim() == 3 else obs_features
+                next_obs_cond = next_obs_features.reshape(next_obs_features.shape[0], -1) if next_obs_features.dim() == 3 else next_obs_features
+                
+                # --- Step 1: Value Network (IQL expectile from action critic target) ---
+                value_optimizer.zero_grad()
+                value_loss, value_metrics = agent.compute_value_loss(
+                    obs_cond.detach(), actions_for_q)
+                value_loss.backward()
+                torch.nn.utils.clip_grad_norm_(agent.value_net.parameters(), 1.0)
+                value_optimizer.step()
+                
+                # --- Step 2: Chunk Critic (Bellman + V-target + BCE) ---
+                chunk_critic_optimizer.zero_grad()
+                chunk_loss, chunk_metrics = agent.compute_chunk_critic_loss(
+                    obs_cond.detach(), next_obs_cond.detach(), action_seq,
+                    cumulative_reward, chunk_done, discount_factor,
+                )
+                chunk_loss.backward()
+                torch.nn.utils.clip_grad_norm_(agent.chunk_critic.parameters(), 1.0)
+                chunk_critic_optimizer.step()
+                critic_lr_scheduler.step()
+                
+                # --- Step 3: Action Critic (distillation from chunk critic) ---
+                action_critic_optimizer.zero_grad()
+                action_loss, action_metrics = agent.compute_action_critic_loss(
+                    obs_cond.detach(), actions_for_q, action_seq,
+                )
+                action_loss.backward()
+                torch.nn.utils.clip_grad_norm_(agent.action_critic.parameters(), 1.0)
+                action_critic_optimizer.step()
+                
+                # --- Step 4: Actor (pure flow matching BC) ---
+                actor_optimizer.zero_grad()
+                actor_loss, actor_flow_metrics = agent.compute_actor_loss(
+                    obs_cond, action_seq)
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(agent.velocity_net.parameters(), 1.0)
+                if visual_encoder is not None:
+                    torch.nn.utils.clip_grad_norm_(visual_encoder.parameters(), 1.0)
+                actor_optimizer.step()
+                actor_lr_scheduler.step()
+                
+                # --- Step 5: Target network soft updates ---
+                agent.update_targets()
+                
+                # Build loss_dict for logging
+                loss_dict = {
+                    "loss": (value_loss + chunk_loss + action_loss + actor_loss).detach(),
+                    "actor_loss": actor_loss.detach(),
+                    "value_loss": value_loss.detach(),
+                    "chunk_critic_loss": chunk_loss.detach(),
+                    "action_critic_loss": action_loss.detach(),
+                }
+                loss_dict.update(value_metrics)
+                loss_dict.update(chunk_metrics)
+                loss_dict.update(action_metrics)
+                loss_dict.update(actor_flow_metrics)
+            else:
+                # Flow-based offline RL (cpql, awcp, aw_shortcut_flow)
+                loss_dict = agent.compute_loss(
+                    obs_features=obs_features,
+                    actions=action_seq,
+                    rewards=rewards,
+                    next_obs_features=next_obs_features,
+                    dones=dones,
+                    actions_for_q=actions_for_q,
+                    cumulative_reward=cumulative_reward,
+                    chunk_done=chunk_done,
+                    discount_factor=discount_factor,
+                )
+                
+                total_loss = loss_dict["loss"]
+                
+                optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
+                if visual_encoder is not None:
+                    torch.nn.utils.clip_grad_norm_(visual_encoder.parameters(), 1.0)
+                optimizer.step()
+                lr_scheduler.step()
+                
+                agent.update_target()
+                if hasattr(agent, "update_ema"):
+                    agent.update_ema()
         
         # EMA update
         ema.step(agent.parameters())
@@ -924,12 +1200,14 @@ def main():
                      for k, v in (loss_dict.items() if isinstance(loss_dict, dict) else {"loss": loss_dict})}
             for k, v in losses.items():
                 writer.add_scalar(f"losses/{k}", v, iteration)
-            writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], iteration)
+            
+            current_lr = actor_optimizer.param_groups[0]["lr"] if args.algorithm in ("sac", "dqc") else optimizer.param_groups[0]["lr"]
+            writer.add_scalar("charts/learning_rate", current_lr, iteration)
             
             # WandB logging
             if args.track:
                 wandb_log = {f"losses/{k}": v for k, v in losses.items()}
-                wandb_log["charts/learning_rate"] = optimizer.param_groups[0]["lr"]
+                wandb_log["charts/learning_rate"] = current_lr
                 wandb_log["charts/iteration"] = iteration
                 wandb.log(wandb_log, step=iteration)
         
@@ -952,12 +1230,12 @@ def main():
             for k in ["success_once", "success_at_end"]:
                 if k in eval_metrics and eval_metrics[k] > best_eval_metrics[k]:
                     best_eval_metrics[k] = eval_metrics[k]
-                    save_ckpt(run_name, f"best_eval_{k}", agent, ema_agent, visual_encoder, action_normalizer)
+                    save_ckpt(run_name, f"best_eval_{k}", agent, ema_agent, visual_encoder, action_normalizer, args=args)
         
         # Checkpoint
         if args.save_freq is not None and iteration % args.save_freq == 0:
             ema.copy_to(ema_agent.parameters())
-            save_ckpt(run_name, str(iteration), agent, ema_agent, visual_encoder, action_normalizer)
+            save_ckpt(run_name, str(iteration), agent, ema_agent, visual_encoder, action_normalizer, args=args)
         
         pbar.update(1)
         if isinstance(loss_dict, dict):
