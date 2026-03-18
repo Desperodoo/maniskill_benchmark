@@ -1,0 +1,8 @@
+prefix=/home/lizh/maniskill_benchmark/carm_ros_deploy/devel
+
+Name: carm_deploy
+Description: Description of carm_deploy
+Version: 1.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

@@ -124,6 +124,31 @@ class Args:
     num_qs: int = 10
     use_layer_norm: bool = True
 
+    # ----- ACP reward mode -----
+    acp_reward: bool = False
+    """Replace sim dense reward with ACP reward."""
+    acp_checkpoint: str = "checkpoints/vlaw/acp/v3_so/best.safetensors"
+    """ACP value model checkpoint (safetensors format)."""
+    acp_reward_scale: float = 100.0
+    """Scale for ACP rewards."""
+    acp_reward_shaping: str = "td"
+    """ACP reward shaping: 'td' = V(s')-V(s), 'potential' = V(s')."""
+    acp_reward_clip: float = 5.0
+    """Clip ACP reward to [-clip, +clip]. 0 = no clipping.
+    v5 validated: clip=5 prevents TD outliers from destabilizing critic."""
+    acp_grasp_bonus: float = 0.0
+    """Per-step bonus when gripper is grasping the object. 0=disabled.
+    Recommended: 1.0-5.0 for SAE improvement. Requires ManiSkill env with is_grasping() API."""
+    acp_device: Optional[str] = None
+    """Device for ACP model. Defaults to cuda:1."""
+    acp_task_instruction: str = "Pick up the peg and lift it upright."
+    """Task instruction for the ACP Gemma encoder."""
+
+    # ----- critic stabilization -----
+    q_target_clip: float = 20.0
+    """Clip TD target to [-clip, +clip]. 0 = no clipping.
+    v5 validated: clip=20 fixes DSRL critic instability (loss 1900→4-37)."""
+
     # ----- logging / eval / saving -----
     log_freq: int = 100
     eval_freq: int = 10_000
@@ -139,11 +164,8 @@ class Args:
 def _make_train_envs(args: Args):
     """Create GPU-vectorized training environments.
 
-    **Critical**: uses the same FrameStack + ManiSkillVectorEnv wrapping as
-    the eval envs so that obs_history is correctly managed by FrameStack
-    (including proper per-env reset on auto-reset).  Without FrameStack the
-    wrapper's manual obs_history roll contaminates observations across
-    episode boundaries.
+    When ``args.acp_reward`` is True, inserts ``DualCameraRewardWrapper``
+    before ``FlattenRGBDObservationWrapper``.
     """
     from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
 
@@ -155,7 +177,24 @@ def _make_train_envs(args: Args):
     if args.max_episode_steps is not None:
         env_kwargs["max_episode_steps"] = args.max_episode_steps
 
-    wrappers = [FlattenRGBDObservationWrapper] if "rgb" in args.obs_mode else []
+    wrappers = []
+
+    if args.acp_reward:
+        env_kwargs["render_mode"] = "rgb_array"
+        from rlft.envs.acp_reward_wrapper import DualCameraRewardWrapper, ACPRewardConfig
+        acp_config = ACPRewardConfig(
+            checkpoint_path=args.acp_checkpoint,
+            task_instruction=args.acp_task_instruction,
+            reward_scale=args.acp_reward_scale,
+            reward_shaping=args.acp_reward_shaping,
+            reward_clip=args.acp_reward_clip,
+            grasp_bonus=args.acp_grasp_bonus,
+            device=args.acp_device or "cuda:1",
+        )
+        wrappers.append(lambda env: DualCameraRewardWrapper(env, acp_config))
+
+    if "rgb" in args.obs_mode:
+        wrappers.append(FlattenRGBDObservationWrapper)
 
     return make_eval_envs(
         env_id=args.env_id,
@@ -430,6 +469,9 @@ def main():
     # =================================================================
     print("[2/5] Creating environments …")
     raw_train_env = _make_train_envs(args)
+    if args.acp_reward:
+        print(f"  ACP reward enabled: {args.acp_checkpoint}")
+        print(f"  ACP device: {args.acp_device or 'cuda:1'}, scale: {args.acp_reward_scale}, shaping: {args.acp_reward_shaping}")
 
     wrapped_train_env = ManiSkillFlowEnvWrapper(
         env=raw_train_env,
@@ -471,6 +513,7 @@ def main():
         target_entropy=args.target_entropy,
         log_std_init=args.log_std_init,
         use_layer_norm=args.use_layer_norm,
+        q_target_clip=args.q_target_clip,
         device=str(device),
     ).to(device)
 
@@ -530,6 +573,7 @@ def main():
     obs, _ = train_adapter.reset()
     total_steps = 0
     best_success = 0.0
+    best_success_at_end = 0.0
     ep_rews = defaultdict(float)
     ep_successes: list = []
     training_metrics = defaultdict(list)
@@ -649,7 +693,19 @@ def main():
                     total_steps=total_steps,
                     save_args_json=False,
                 )
-                print(f"  New best! ({sr:.2%})")
+                print(f"  New best SO! ({sr:.2%})")
+
+            sae = eval_met.get("success_at_end", 0)
+            if sae > best_success_at_end:
+                best_success_at_end = sae
+                save_checkpoint(
+                    path=f"{log_dir}/checkpoints/best_sae.pt",
+                    agent=agent,
+                    args=args,
+                    total_steps=total_steps,
+                    save_args_json=False,
+                )
+                print(f"  New best SAE! ({sae:.2%})")
 
         # ---- checkpoint ----
         if total_steps % args.save_freq < train_adapter.num_envs:
@@ -687,10 +743,13 @@ def main():
     writer.close()
 
     if args.track and HAS_WANDB:
-        wandb.log({"final/best_success_rate": best_success})
+        wandb.log({
+            "final/best_success_rate": best_success,
+            "final/best_success_at_end": best_success_at_end,
+        })
         wandb.finish()
 
-    print(f"\nDone. Best success rate: {best_success:.2%}")
+    print(f"\nDone. Best SO: {best_success:.2%}, Best SAE: {best_success_at_end:.2%}")
 
 
 if __name__ == "__main__":

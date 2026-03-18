@@ -18,7 +18,7 @@ Key differences from ``DSRLSACAgent``:
     * Supports **offline/online mixed replay** for RLPD-style training.
     * Includes **Cal-QL critic pretraining** for stable exploration warm-start.
     * Default action_scale=0.3 (PLD sweep: optimal residual range).
-    * Hidden dims = [1024,1024,1024], num_qs = 5 (tuned via PLD sweep).
+    * Hidden dims = [768,768,768], num_qs = 5 (tuned via PLD sweep v1-v3).
 
 Reference:
     - PLD: https://arxiv.org/abs/2511.00091
@@ -265,16 +265,17 @@ class PLDSACAgent(nn.Module):
         hidden_dims: list = None,
         num_qs: int = 5,
         gamma: float = 0.99,
-        tau: float = 0.005,
-        init_temperature: float = 0.1,
+        tau: float = 0.001,
+        init_temperature: float = 0.5,
         target_entropy: Optional[float] = None,
         log_std_init: float = -5.0,
         use_layer_norm: bool = True,
+        q_target_clip: float = 0.0,
         device: str = "cuda",
     ):
         super().__init__()
         if hidden_dims is None:
-            hidden_dims = [1024, 1024, 1024]
+            hidden_dims = [768, 768, 768]
 
         self.obs_dim = obs_dim
         self.act_steps = act_steps
@@ -283,6 +284,7 @@ class PLDSACAgent(nn.Module):
         self.residual_dim = act_steps * action_dim
         self.gamma = gamma
         self.tau = tau
+        self.q_target_clip = q_target_clip
         self.device = device
 
         # Target entropy: PLD paper uses target_entropy = -dim(a)
@@ -368,6 +370,8 @@ class PLDSACAgent(nn.Module):
             target_q = self.critic_target.get_min_q(next_a_delta, next_obs)
             target_q = target_q - self.alpha.detach() * next_log_prob.unsqueeze(-1)
             td_target = rewards + (1 - dones) * self.gamma * target_q
+            if self.q_target_clip > 0:
+                td_target = torch.clamp(td_target, -self.q_target_clip, self.q_target_clip)
 
         q_all = self.critic(actions, obs)  # (num_qs, B, 1)
         critic_loss = sum(F.mse_loss(q, td_target) for q in q_all)
