@@ -18,3 +18,5 @@ rlft/algorithm/offline_rl/__pycache__/
 rlft/algorithm/online_rl/__pycache__/
 runs/
 wandb/
+recorded_data/
+inference_logs/
