@@ -223,40 +223,21 @@ struct Printer< ::realsense2_camera::Extrinsics_<ContainerAllocator> >
 {
   template<typename Stream> static void stream(Stream& s, const std::string& indent, const ::realsense2_camera::Extrinsics_<ContainerAllocator>& v)
   {
-    if (false || !indent.empty())
-      s << std::endl;
     s << indent << "header: ";
+    s << std::endl;
     Printer< ::std_msgs::Header_<ContainerAllocator> >::stream(s, indent + "  ", v.header);
-    if (true || !indent.empty())
-      s << std::endl;
-    s << indent << "rotation: ";
-    if (v.rotation.empty() || true)
-      s << "[";
+    s << indent << "rotation[]" << std::endl;
     for (size_t i = 0; i < v.rotation.size(); ++i)
     {
-      if (true && i > 0)
-        s << ", ";
-      else if (!true)
-        s << std::endl << indent << "  -";
-      Printer<double>::stream(s, true ? std::string() : indent + "    ", v.rotation[i]);
+      s << indent << "  rotation[" << i << "]: ";
+      Printer<double>::stream(s, indent + "  ", v.rotation[i]);
     }
-    if (v.rotation.empty() || true)
-      s << "]";
-    if (true || !indent.empty())
-      s << std::endl;
-    s << indent << "translation: ";
-    if (v.translation.empty() || true)
-      s << "[";
+    s << indent << "translation[]" << std::endl;
     for (size_t i = 0; i < v.translation.size(); ++i)
     {
-      if (true && i > 0)
-        s << ", ";
-      else if (!true)
-        s << std::endl << indent << "  -";
-      Printer<double>::stream(s, true ? std::string() : indent + "    ", v.translation[i]);
+      s << indent << "  translation[" << i << "]: ";
+      Printer<double>::stream(s, indent + "  ", v.translation[i]);
     }
-    if (v.translation.empty() || true)
-      s << "]";
   }
 };
 

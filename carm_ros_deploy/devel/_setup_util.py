@@ -1,4 +1,4 @@
-#!/home/lizh/miniconda3/envs/carm/bin/python
+#!/home/amax/miniforge-pypy3/envs/carm/bin/python
 # -*- coding: utf-8 -*-
 
 # Software License Agreement (BSD License)
@@ -268,7 +268,7 @@ if __name__ == '__main__':
 
         if not args.local:
             # environment at generation time
-            CMAKE_PREFIX_PATH = r'/home/lizh/maniskill_benchmark/arm_control_sdk;/opt/ros/noetic'.split(';')
+            CMAKE_PREFIX_PATH = r'/home/amax/maniskill_benchmark/arm_control_sdk;/opt/ros/noetic;/opt/ros/noetic/'.split(';')
         else:
             # don't consider any other prefix path than this one
             CMAKE_PREFIX_PATH = []

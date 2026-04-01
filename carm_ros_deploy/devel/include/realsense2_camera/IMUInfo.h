@@ -218,55 +218,26 @@ struct Printer< ::realsense2_camera::IMUInfo_<ContainerAllocator> >
 {
   template<typename Stream> static void stream(Stream& s, const std::string& indent, const ::realsense2_camera::IMUInfo_<ContainerAllocator>& v)
   {
-    if (false || !indent.empty())
-      s << std::endl;
     s << indent << "frame_id: ";
     Printer<std::basic_string<char, std::char_traits<char>, typename std::allocator_traits<ContainerAllocator>::template rebind_alloc<char>>>::stream(s, indent + "  ", v.frame_id);
-    if (true || !indent.empty())
-      s << std::endl;
-    s << indent << "data: ";
-    if (v.data.empty() || true)
-      s << "[";
+    s << indent << "data[]" << std::endl;
     for (size_t i = 0; i < v.data.size(); ++i)
     {
-      if (true && i > 0)
-        s << ", ";
-      else if (!true)
-        s << std::endl << indent << "  -";
-      Printer<double>::stream(s, true ? std::string() : indent + "    ", v.data[i]);
+      s << indent << "  data[" << i << "]: ";
+      Printer<double>::stream(s, indent + "  ", v.data[i]);
     }
-    if (v.data.empty() || true)
-      s << "]";
-    if (true || !indent.empty())
-      s << std::endl;
-    s << indent << "noise_variances: ";
-    if (v.noise_variances.empty() || true)
-      s << "[";
+    s << indent << "noise_variances[]" << std::endl;
     for (size_t i = 0; i < v.noise_variances.size(); ++i)
     {
-      if (true && i > 0)
-        s << ", ";
-      else if (!true)
-        s << std::endl << indent << "  -";
-      Printer<double>::stream(s, true ? std::string() : indent + "    ", v.noise_variances[i]);
+      s << indent << "  noise_variances[" << i << "]: ";
+      Printer<double>::stream(s, indent + "  ", v.noise_variances[i]);
     }
-    if (v.noise_variances.empty() || true)
-      s << "]";
-    if (true || !indent.empty())
-      s << std::endl;
-    s << indent << "bias_variances: ";
-    if (v.bias_variances.empty() || true)
-      s << "[";
+    s << indent << "bias_variances[]" << std::endl;
     for (size_t i = 0; i < v.bias_variances.size(); ++i)
     {
-      if (true && i > 0)
-        s << ", ";
-      else if (!true)
-        s << std::endl << indent << "  -";
-      Printer<double>::stream(s, true ? std::string() : indent + "    ", v.bias_variances[i]);
+      s << indent << "  bias_variances[" << i << "]: ";
+      Printer<double>::stream(s, indent + "  ", v.bias_variances[i]);
     }
-    if (v.bias_variances.empty() || true)
-      s << "]";
   }
 };
 

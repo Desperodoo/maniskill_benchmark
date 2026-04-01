@@ -1,9 +1,9 @@
-#!/home/lizh/miniconda3/envs/carm/bin/python
+#!/home/amax/miniforge-pypy3/envs/carm/bin/python
 # -*- coding: utf-8 -*-
 # generated from catkin/cmake/template/script.py.in
 # creates a relay to a python script source file, acting as that file.
 # The purpose is that of a symlink
-python_script = '/home/lizh/maniskill_benchmark/carm_ros_deploy/src/carm_deploy/inference/inference_ros.py'
+python_script = '/home/amax/maniskill_benchmark/carm_ros_deploy/src/carm_deploy/inference/inference_ros.py'
 with open(python_script, 'r') as fh:
     context = {
         '__builtins__': __builtins__,

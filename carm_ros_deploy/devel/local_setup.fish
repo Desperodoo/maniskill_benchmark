@@ -5,7 +5,7 @@
 # or fall back to the destination set at configure time
 
 if test -z $_CATKIN_SETUP_DIR
-    set _CATKIN_SETUP_DIR /home/lizh/maniskill_benchmark/carm_ros_deploy/devel
+    set _CATKIN_SETUP_DIR /home/amax/maniskill_benchmark/carm_ros_deploy/devel
 end
 
 set CATKIN_SETUP_UTIL_ARGS "--extend --local"

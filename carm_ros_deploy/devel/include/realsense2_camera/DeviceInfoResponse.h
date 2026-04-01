@@ -225,28 +225,16 @@ struct Printer< ::realsense2_camera::DeviceInfoResponse_<ContainerAllocator> >
 {
   template<typename Stream> static void stream(Stream& s, const std::string& indent, const ::realsense2_camera::DeviceInfoResponse_<ContainerAllocator>& v)
   {
-    if (false || !indent.empty())
-      s << std::endl;
     s << indent << "device_name: ";
     Printer<std::basic_string<char, std::char_traits<char>, typename std::allocator_traits<ContainerAllocator>::template rebind_alloc<char>>>::stream(s, indent + "  ", v.device_name);
-    if (true || !indent.empty())
-      s << std::endl;
     s << indent << "serial_number: ";
     Printer<std::basic_string<char, std::char_traits<char>, typename std::allocator_traits<ContainerAllocator>::template rebind_alloc<char>>>::stream(s, indent + "  ", v.serial_number);
-    if (true || !indent.empty())
-      s << std::endl;
     s << indent << "firmware_version: ";
     Printer<std::basic_string<char, std::char_traits<char>, typename std::allocator_traits<ContainerAllocator>::template rebind_alloc<char>>>::stream(s, indent + "  ", v.firmware_version);
-    if (true || !indent.empty())
-      s << std::endl;
     s << indent << "usb_type_descriptor: ";
     Printer<std::basic_string<char, std::char_traits<char>, typename std::allocator_traits<ContainerAllocator>::template rebind_alloc<char>>>::stream(s, indent + "  ", v.usb_type_descriptor);
-    if (true || !indent.empty())
-      s << std::endl;
     s << indent << "firmware_update_id: ";
     Printer<std::basic_string<char, std::char_traits<char>, typename std::allocator_traits<ContainerAllocator>::template rebind_alloc<char>>>::stream(s, indent + "  ", v.firmware_update_id);
-    if (true || !indent.empty())
-      s << std::endl;
     s << indent << "sensors: ";
     Printer<std::basic_string<char, std::char_traits<char>, typename std::allocator_traits<ContainerAllocator>::template rebind_alloc<char>>>::stream(s, indent + "  ", v.sensors);
   }
