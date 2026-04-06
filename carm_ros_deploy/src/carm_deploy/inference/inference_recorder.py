@@ -31,6 +31,7 @@ HDF5 文件结构:
         └── ...
 """
 
+import glob
 import os
 import time
 import json
@@ -320,6 +321,9 @@ class InferenceRecorder:
                         continue
                     cameras_grp.create_dataset(camera_name, data=np.array(camera_images), compression='gzip')
             
+            qpos_joint = np.array(data['qpos_joint'])  # [T, 7]
+            obs_grp.create_dataset('qpos_joint', data=qpos_joint)
+
             qpos_end = np.array(data['qpos_end'])  # [T, 8]
             obs_grp.create_dataset('qpos_end', data=qpos_end)
             
@@ -358,6 +362,9 @@ class InferenceRecorder:
             f.attrs['created_at'] = timestamp
             f.attrs['data_source'] = 'inference_with_intervention'
             f.attrs['timestamp_semantics'] = 'obs_stamp_ros'
+            f.attrs['action_semantics_version'] = 'absolute_ee_target_pose_v2'
+            f.attrs['action_space'] = 'ee_target_pose_absolute'
+            f.attrs['compat_action_source'] = 'action_intervened[:,0,:]'
             f.attrs['camera_topics'] = json.dumps(self.camera_topics)
             f.attrs['camera_names'] = json.dumps(self.camera_names)
             f.attrs['primary_camera'] = self.primary_camera or ''
@@ -397,7 +404,7 @@ class InferenceDatasetConverter:
     ):
         """
         转换为训练格式
-        
+
         Args:
             input_path: 输入 HDF5 文件路径
             output_path: 输出 HDF5 文件路径
@@ -406,45 +413,91 @@ class InferenceDatasetConverter:
         """
         with h5py.File(input_path, 'r') as f_in:
             num_steps = f_in.attrs['num_steps']
-            
+            output_path = os.path.expandvars(os.path.expanduser(output_path))
+            os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+
             # 选择 action 源
             if use_intervened_action:
                 action_source = f_in['action_intervened'][:]
             else:
                 action_source = f_in['action_model'][:]
-            
+
             # 取每步的第一个 action
             action = action_source[:, 0, :]  # [T, action_dim]
-            
+
             # 干预掩码
             intervention_mask = f_in['intervention_mask'][:]
             has_intervention = intervention_mask[:, 0, :].any(axis=1)  # [T]
-            
+
             # 过滤干预帧
             if filter_intervention:
                 keep_idx = ~has_intervention
                 _log_info(f"Filtering intervention frames: {has_intervention.sum()}/{num_steps}")
             else:
                 keep_idx = np.ones(num_steps, dtype=bool)
-            
+
             with h5py.File(output_path, 'w') as f_out:
                 obs_grp = f_out.create_group('observations')
-                
+
                 # 复制观测数据
                 for key in f_in['observations'].keys():
-                    data = f_in['observations'][key][:][keep_idx]
+                    node = f_in['observations'][key]
+                    if isinstance(node, h5py.Group):
+                        out_group = obs_grp.create_group(key)
+                        for subkey in node.keys():
+                            subdata = node[subkey][:][keep_idx]
+                            out_group.create_dataset(subkey, data=subdata, compression='gzip')
+                        continue
+
+                    data = node[:][keep_idx]
                     if key == 'images':
                         obs_grp.create_dataset(key, data=data, compression='gzip')
                     else:
                         obs_grp.create_dataset(key, data=data)
-                
+
                 # Action
                 f_out.create_dataset('action', data=action[keep_idx])
-                
+
                 # 元数据
                 f_out.attrs['num_steps'] = int(keep_idx.sum())
                 f_out.attrs['filtered_intervention'] = filter_intervention
                 f_out.attrs['source_file'] = os.path.basename(input_path)
+                if 'timestamp_semantics' in f_in.attrs:
+                    f_out.attrs['timestamp_semantics'] = f_in.attrs['timestamp_semantics']
+                if 'camera_topics' in f_in.attrs:
+                    f_out.attrs['camera_topics'] = f_in.attrs['camera_topics']
+                if 'camera_names' in f_in.attrs:
+                    f_out.attrs['camera_names'] = f_in.attrs['camera_names']
+                if 'primary_camera' in f_in.attrs:
+                    f_out.attrs['primary_camera'] = f_in.attrs['primary_camera']
+
+    @staticmethod
+    def convert_directory_to_training_format(
+        input_dir: str,
+        output_dir: str,
+        use_intervened_action: bool = True,
+        filter_intervention: bool = False,
+    ) -> list[str]:
+        """批量将 inference_episode_*.hdf5 转换到训练 staging 目录。"""
+        input_dir = os.path.expandvars(os.path.expanduser(input_dir))
+        output_dir = os.path.expandvars(os.path.expanduser(output_dir))
+        os.makedirs(output_dir, exist_ok=True)
+
+        input_paths = sorted(
+            glob.glob(os.path.join(input_dir, 'inference_episode_*.hdf5'))
+        )
+        converted = []
+        for idx, input_path in enumerate(input_paths, start=1):
+            output_name = f'episode_{idx:04d}_{os.path.basename(input_path).replace("inference_episode_", "")}'
+            output_path = os.path.join(output_dir, output_name)
+            InferenceDatasetConverter.convert_to_training_format(
+                input_path=input_path,
+                output_path=output_path,
+                use_intervened_action=use_intervened_action,
+                filter_intervention=filter_intervention,
+            )
+            converted.append(output_path)
+        return converted
 
 
 if __name__ == '__main__':
