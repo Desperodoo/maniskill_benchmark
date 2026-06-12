@@ -1,4 +1,4 @@
-prefix=/home/amax/maniskill_benchmark/carm_ros_deploy/devel
+prefix=/home/amax/rl-vla/carm_ros_deploy/devel
 
 Name: carm_deploy
 Description: Description of carm_deploy

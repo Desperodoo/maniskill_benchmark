@@ -59,6 +59,10 @@ _core_mock.SafetyController = _sc_mod.SafetyController
 _core_mock.safety_controller = _sc_mod
 sys.modules["core"] = _core_mock
 
+_camera_config_mock = types.ModuleType("core.camera_config")
+_camera_config_mock.resolve_camera_config = mock.MagicMock()
+sys.modules["core.camera_config"] = _camera_config_mock
+
 # Mock env_ros entirely
 _env_ros_mock = types.ModuleType("core.env_ros")
 _env_ros_mock.RealEnvironment = mock.MagicMock()
@@ -90,11 +94,10 @@ _rec_mock = types.ModuleType("inference.inference_recorder")
 _rec_mock.InferenceRecorder = mock.MagicMock()
 sys.modules["inference.inference_recorder"] = _rec_mock
 
-# Mock keyboard_intervention
-_ki_mock = types.ModuleType("utils.keyboard_intervention")
-_ki_mock.KeyboardInterventionHandler = mock.MagicMock()
-_ki_mock.InterventionApplier = mock.MagicMock()
-sys.modules["utils.keyboard_intervention"] = _ki_mock
+# Mock episode keyboard controls
+_episode_keyboard_mock = types.ModuleType("utils.episode_keyboard")
+_episode_keyboard_mock.EpisodeKeyboardHandler = mock.MagicMock()
+sys.modules["utils.episode_keyboard"] = _episode_keyboard_mock
 
 # ---------------------------------------------------------------------------
 # NOW import InferenceNode
@@ -141,7 +144,7 @@ def _make_node(config_overrides=None, fake_checkpoint_dir=None):
          mock.patch.object(InferenceNode, "_create_safety_controller") as mock_safety, \
          mock.patch.object(InferenceNode, "_create_logger") as mock_logger, \
          mock.patch.object(InferenceNode, "_setup_logger_metadata"), \
-         mock.patch.object(InferenceNode, "_init_intervention_and_recording", create=True):
+         mock.patch.object(InferenceNode, "_init_recording_controls", create=True):
         
         MockThread.return_value = mock.MagicMock()
 
@@ -217,3 +220,59 @@ class TestNodeConfigPropagation:
     def test_act_horizon_override(self):
         node = _make_node({"act_horizon": 8})
         assert node._act_horizon == 8
+
+    def test_hitl_defaults_disabled(self):
+        node = _make_node()
+        assert node.hitl_mode == "disabled"
+        assert node.hitl_enabled is False
+        assert node.hitl_human_execute_mode == "direct"
+
+    def test_hitl_candidate_initializes_candidate_manager(self):
+        node = _make_node({"hitl_mode": "candidate"})
+        assert node.hitl_enabled is True
+        assert node.hitl_candidate_manager is not None
+
+    def test_hitl_live_initializes_owner_state(self):
+        node = _make_node({"hitl_mode": "live"})
+        assert node.hitl_enabled is True
+        assert node.hitl_live_owner_active is False
+        assert node.hitl_live_state["shared_source"] == "policy"
+
+    def test_hitl_human_execute_mode_configurable(self):
+        node = _make_node({"hitl_mode": "live", "hitl_human_execute_mode": "scheduled"})
+        assert node.hitl_human_execute_mode == "scheduled"
+        assert node.hitl_live_state["human_execute_mode"] == "scheduled"
+
+    def test_hitl_episode_state_reset_restores_policy_defaults(self):
+        node = _make_node({"hitl_mode": "live"})
+        node.hitl_candidate_state["shared_source"] = "candidate"
+        node.hitl_live_state["shared_source"] = "human"
+        node.hitl_live_state["human_valid"] = True
+        node.hitl_human_builder = mock.MagicMock()
+        node._reset_hitl_episode_state()
+        assert node.hitl_candidate_state["shared_source"] == "policy"
+        assert node.hitl_live_state["shared_source"] == "policy"
+        assert node.hitl_live_state["human_valid"] is False
+        node.hitl_human_builder.reset.assert_called_once()
+
+    def test_start_episode_prefers_fresh_state_observation_for_hold_seed(self):
+        node = _make_node({"hitl_mode": "live", "record_inference": True})
+        node.inference_recorder = mock.MagicMock()
+        node.latest_obs = {
+            "qpos_end": np.array([0.1, 0.0, 0.23, 0.0, 0.0, 0.0, 1.0, 0.07], dtype=np.float64)
+        }
+        node.env.get_state_observation.return_value = {
+            "qpos_end": np.array([0.2, 0.0, 0.325, 0.0, 0.0, 0.0, 1.0, 0.08], dtype=np.float64)
+        }
+        node._activate_hitl_live_owner = mock.MagicMock(return_value=True)
+        node._record_start_transition_event = mock.MagicMock()
+        node._add_chunk_to_manager = mock.MagicMock(return_value=(123, [], 0.02, 8))
+        node.policy.reset = mock.MagicMock()
+        node._reset_hitl_episode_state = mock.MagicMock()
+
+        node._start_new_episode()
+
+        seeded_chunk = node._add_chunk_to_manager.call_args.args[1]
+        assert seeded_chunk.shape[1] == 8
+        assert seeded_chunk[0, 2] == pytest.approx(0.325)
+        assert seeded_chunk[0, 7] == pytest.approx(0.08)

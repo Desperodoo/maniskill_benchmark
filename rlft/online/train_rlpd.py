@@ -213,11 +213,10 @@ class Args:
     ManiSkill environments have action space [-1, 1], so we clamp by default."""
 
     # ACP reward mode
-    reward_mode: Literal["sim", "acp", "acp_blend"] = "sim"
+    reward_mode: Literal["sim", "acp"] = "sim"
     """Reward source for online RL:
     - 'sim': ManiSkill dense reward (default, no behavior change)
-    - 'acp': ACP value model TD reward r(s,s') = (V(s')-V(s))*scale
-    - 'acp_blend': weighted blend of ACP + sim reward"""
+    - 'acp': ACP value model TD reward r(s,s') = (V(s')-V(s))*scale"""
     acp_checkpoint: str = "checkpoints/vlaw/acp/v3_so/best.safetensors"
     """ACP value model checkpoint path (only used when reward_mode != 'sim').
     v5 validated: v3_so is the best ACP checkpoint for RLPD."""
@@ -229,13 +228,9 @@ class Args:
     acp_reward_clip: float = 5.0
     """Clip ACP reward to [-clip, +clip]. 0 = no clipping.
     v5 validated: clip=5 yields SAE=70% (best AWSC config)."""
-    acp_blend_weight: float = 0.5
-    """Weight for ACP reward in blend mode: total = w*r_acp + (1-w)*r_sim"""
     acp_device: Optional[str] = None
     """Device for ACP model. Defaults to 'cuda:1' to separate from RL training GPU.
     Set explicitly when using CUDA_VISIBLE_DEVICES remapping."""
-    acp_warmup_steps: int = 0
-    """Use sim reward for first N env steps before switching to ACP reward."""
     acp_task_instruction: str = "Pick up the peg and lift it upright."
     """Task instruction text for the ACP Gemma language encoder."""
 
@@ -303,7 +298,7 @@ class AgentWrapper:
                     rgb = torch.from_numpy(rgb).to(self.device)
                 rgb = rgb.contiguous()  # Ensure contiguous memory layout
                 rgb_flat = rgb.reshape(B * T, *rgb.shape[2:]).float() / 255.0
-                if rgb_flat.ndim == 4 and rgb_flat.shape[-1] == 3:
+                if rgb_flat.ndim == 4 and rgb_flat.shape[-1] in [1, 3, 4, 6, 9, 12]:
                     rgb_flat = rgb_flat.permute(0, 3, 1, 2).contiguous()
                 
                 # Handle depth if available
@@ -389,6 +384,7 @@ def make_train_envs(args):
         import gymnasium as gym
         import mani_skill.envs
         from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
+        from rlft.envs.camera_selection import SelectManiSkillCamerasWrapper
     except ImportError:
         raise ImportError("ManiSkill3 is required. Install with: pip install mani-skill")
 
@@ -401,7 +397,7 @@ def make_train_envs(args):
     )
 
     # ACP reward mode requires render_mode for the second camera viewpoint
-    if args.reward_mode in ("acp", "acp_blend"):
+    if args.reward_mode == "acp":
         env_kwargs["render_mode"] = "rgb_array"
 
     if args.max_episode_steps is not None:
@@ -410,7 +406,7 @@ def make_train_envs(args):
     env = gym.make(args.env_id, **env_kwargs)
 
     # Insert ACP reward wrapper BEFORE FlattenRGBDObservationWrapper
-    if args.reward_mode in ("acp", "acp_blend"):
+    if args.reward_mode == "acp":
         from rlft.envs.acp_reward_wrapper import DualCameraRewardWrapper, ACPRewardConfig
         acp_config = ACPRewardConfig(
             checkpoint_path=args.acp_checkpoint,
@@ -419,21 +415,16 @@ def make_train_envs(args):
             reward_shaping=args.acp_reward_shaping,
             reward_clip=args.acp_reward_clip,
             device=args.acp_device or "cuda:1",
-            warmup_steps=args.acp_warmup_steps,
         )
-        if args.reward_mode == "acp_blend":
-            acp_config.use_sim_reward_bonus = True
-            acp_config.sim_reward_weight = 1.0 - args.acp_blend_weight
         env = DualCameraRewardWrapper(env, acp_config)
         print(f"ACP reward mode: {args.reward_mode}")
         print(f"  checkpoint: {args.acp_checkpoint}")
         print(f"  reward_scale: {args.acp_reward_scale}")
         print(f"  device: {acp_config.device}")
-        if args.reward_mode == "acp_blend":
-            print(f"  blend_weight: {args.acp_blend_weight} (acp) / {1 - args.acp_blend_weight} (sim)")
 
     if "rgb" in args.obs_mode:
         env = FlattenRGBDObservationWrapper(env, rgb=True, depth=False, state=True)
+        env = SelectManiSkillCamerasWrapper(env)
 
     return env
 
@@ -672,7 +663,8 @@ def main():
     
     # Import wrapper for evaluation environment
     from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
-    eval_wrappers = [FlattenRGBDObservationWrapper] if "rgb" in args.obs_mode else []
+    from rlft.envs.camera_selection import SelectManiSkillCamerasWrapper
+    eval_wrappers = [FlattenRGBDObservationWrapper, SelectManiSkillCamerasWrapper] if "rgb" in args.obs_mode else []
     
     eval_envs = make_eval_envs(
         env_id=args.env_id,
@@ -707,8 +699,23 @@ def main():
     visual_feature_dim = 0
     
     if include_rgb:
+        visual_in_channels = 3
+        if hasattr(obs_space, "spaces") and "rgb" in obs_space.spaces:
+            visual_in_channels = int(obs_space["rgb"].shape[-1])
+        if args.pretrain_path:
+            try:
+                checkpoint = torch.load(args.pretrain_path, map_location="cpu")
+                visual_state = checkpoint.get("visual_encoder")
+                if visual_state is not None:
+                    for value in visual_state.values():
+                        if getattr(value, "ndim", 0) == 4:
+                            visual_in_channels = int(value.shape[1])
+                            break
+            except Exception as exc:
+                print(f"Warning: could not infer visual channels from checkpoint: {exc}")
+        print(f"Visual encoder input channels: {visual_in_channels}")
         visual_encoder = PlainConv(
-            in_channels=3,
+            in_channels=visual_in_channels,
             out_dim=args.visual_feature_dim,
             pool_feature_map=True,
         ).to(device)
@@ -846,6 +853,9 @@ def main():
     
     # Replay buffers
     rgb_shape = (128, 128, 3)
+    if include_rgb and hasattr(obs_space, "spaces") and "rgb" in obs_space.spaces:
+        rgb_shape = tuple(int(dim) for dim in obs_space["rgb"].shape[-3:])
+    print(f"Replay buffer RGB shape: {rgb_shape}")
     online_buffer = OnlineReplayBufferRaw(
         capacity=args.replay_buffer_capacity,
         num_envs=args.num_envs,
@@ -916,24 +926,39 @@ def main():
     # Offline dataset for RLPD (use OfflineRLDataset for SMDP formulation)
     offline_dataset = None
     if args.demo_path:
-        offline_dataset = OfflineRLDataset(
-            data_path=args.demo_path,
-            include_rgb=include_rgb,
-            num_traj=args.num_demos,
-            obs_horizon=args.obs_horizon,
-            pred_horizon=args.pred_horizon,
-            act_horizon=args.act_horizon,
-            control_mode=args.control_mode,
-            env_id=args.env_id,
-            rgb_format="NCHW",
-            gamma=args.gamma,
-            device=device,
-            action_normalizer=action_normalizer,
-        )
+        try:
+            offline_dataset = OfflineRLDataset(
+                data_path=args.demo_path,
+                include_rgb=include_rgb,
+                num_traj=args.num_demos,
+                obs_horizon=args.obs_horizon,
+                pred_horizon=args.pred_horizon,
+                act_horizon=args.act_horizon,
+                control_mode=args.control_mode,
+                env_id=args.env_id,
+                rgb_format="NCHW",
+                gamma=args.gamma,
+                device=device,
+                action_normalizer=action_normalizer,
+            )
+        except KeyError as e:
+            if str(e) == '"obs"' or str(e) == "'obs'":
+                raise KeyError(
+                    "RLPD expects a ManiSkill demo HDF5 with traj['obs'] (e.g. trajectory.rgb*.h5). "
+                    f"Got incompatible schema from demo_path={args.demo_path}. "
+                    "VLAW rollout files are not currently supported by train_rlpd."
+                ) from e
+            raise
         print(f"Offline dataset size: {len(offline_dataset)}")
         
-        # Precompute cache for faster sampling (up to 50k samples)
-        offline_dataset.precompute_cache(max_cache_size=min(50000, len(offline_dataset)))
+        # Precompute cache for faster sampling. RGB ManiSkill online training can
+        # exceed 24GB on PegInsertion, so allow launchers to cap this without
+        # changing the default behavior.
+        offline_cache_size = int(os.environ.get("RLFT_OFFLINE_CACHE_SIZE", "50000"))
+        if offline_cache_size > 0:
+            offline_dataset.precompute_cache(max_cache_size=min(offline_cache_size, len(offline_dataset)))
+        else:
+            print("Offline cache disabled via RLFT_OFFLINE_CACHE_SIZE=0")
     
     # Agent wrapper for evaluation (created after action_normalizer is fitted)
     agent_wrapper = AgentWrapper(
@@ -947,7 +972,8 @@ def main():
     )
     
     # ========== Pre-training Evaluation (Baseline) ==========
-    if args.pretrain_path:
+    skip_pretrain_eval = os.environ.get("RLFT_SKIP_PRETRAIN_EVAL", "0") == "1"
+    if args.pretrain_path and not skip_pretrain_eval:
         print("\n" + "=" * 50)
         print("Evaluating pretrained model (baseline)...")
         print("=" * 50)
@@ -973,6 +999,8 @@ def main():
             wandb.log(pretrain_log)
         
         print("=" * 50 + "\n")
+    elif args.pretrain_path:
+        print("Skipping pretrained baseline evaluation via RLFT_SKIP_PRETRAIN_EVAL=1")
     
     # Training loop
     print("\n" + "=" * 50)
@@ -1014,6 +1042,9 @@ def main():
     
     # Training metrics accumulator
     training_metrics = defaultdict(list)
+    action_clip = float(os.environ.get("RLFT_ACTION_CLIP", "1.0"))
+    if action_clip < 1.0:
+        print(f"Clipping online action chunks to [-{action_clip}, {action_clip}] via RLFT_ACTION_CLIP")
     
     pbar = tqdm(total=args.total_timesteps, desc="Training")
     
@@ -1032,6 +1063,8 @@ def main():
                 action_chunk = np.random.uniform(-1, 1, (args.num_envs, args.act_horizon, action_dim))
             else:
                 action_chunk = agent.select_action(obs_features, deterministic=False).cpu().numpy()
+            if action_clip < 1.0:
+                action_chunk = np.clip(action_chunk, -action_clip, action_clip)
         
         # Execute action chunk
         chunk_collector.reset()

@@ -57,6 +57,7 @@ class InferenceLogger:
             'normalizer': {},
             'control': {},
             'execution': {},
+            'hitl': {},
             'safety': {},
             'files': {
                 'episode_hdf5': [],
@@ -83,6 +84,7 @@ class InferenceLogger:
         normalizer_config: Dict = None,
         control_config: Dict = None,
         execution_config: Dict = None,
+        hitl_config: Dict = None,
         safety_config: Dict = None,
     ):
         """设置运行信息与配置快照。"""
@@ -100,6 +102,8 @@ class InferenceLogger:
             self.run_info['control'].update(control_config)
         if execution_config:
             self.run_info['execution'].update(execution_config)
+        if hitl_config:
+            self.run_info['hitl'].update(hitl_config)
         if safety_config:
             self.run_info['safety'].update(safety_config)
 
@@ -134,12 +138,16 @@ class InferenceLogger:
 
         _log_info(f"Run-info session started: run_info_{self._timestamp_suffix}.json")
 
-    def record_episode_file(self, episode_path: str):
-        """记录 canonical recorder episode 文件名。"""
+    def record_episode_file(self, episode_path: str, success: Optional[bool] = None, outcome_label: Optional[str] = None):
+        """记录 canonical recorder episode 文件名与 outcome。"""
         basename = os.path.basename(episode_path)
         episode_files = self.run_info['files'].setdefault('episode_hdf5', [])
         if basename not in episode_files:
             episode_files.append(basename)
+        if success is not None:
+            self.run_info.setdefault('summary', {})['episode_success'] = bool(success)
+        if outcome_label is not None:
+            self.run_info.setdefault('summary', {})['episode_outcome_label'] = str(outcome_label)
 
     def log_step(
         self,
@@ -152,7 +160,7 @@ class InferenceLogger:
         safety_warnings: List[str] = None,
         safety_reason_counts: Optional[Dict[str, int]] = None,
     ):
-        """记录单步摘要，保留接口兼容性但不再写 HDF5。"""
+        """记录单步摘要，HDF5 数据由 InferenceRecorder 单独负责。"""
         self.step_count += 1
         if inference_time > 0:
             self._inference_times.append(float(inference_time))
@@ -206,6 +214,8 @@ class InferenceLogger:
             'safety_clips': self._safety_clips,
             'safety_clip_rate': self._safety_clips / self.step_count if self.step_count > 0 else 0,
             'safety_reason_counts': dict(self._safety_reason_counts),
+            'episode_success': self.run_info.get('summary', {}).get('episode_success'),
+            'episode_outcome_label': self.run_info.get('summary', {}).get('episode_outcome_label'),
         }
 
 

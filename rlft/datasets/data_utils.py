@@ -159,7 +159,7 @@ def load_traj_hdf5(path: str, num_traj: Optional[int] = None) -> Dict:
 # 1. State: Concatenate all arrays in obs["agent"] and obs["extra"]
 #    Example: qpos(9) + qvel(9) + tcp_pose(7) + ... = state_dim
 #
-# 2. RGB: Stack all camera rgb images along channel dimension
+# 2. RGB: Stack selected camera rgb images along channel dimension
 #    Example: base_camera(H,W,3) + hand_camera(H,W,3) -> (H,W,6) -> transpose to (6,H,W)
 #
 # =============================================================================
@@ -219,6 +219,11 @@ def create_obs_process_fn(env_id: str, output_format: str = "NCHW") -> Callable:
         >>> processed["rgb"].shape    # (T, 3, 128, 128) with single camera
     """
     state_extractor = build_state_obs_extractor(env_id)
+    camera_names = [
+        name.strip()
+        for name in os.environ.get("RLFT_MANISKILL_CAMERA_NAMES", "").split(",")
+        if name.strip()
+    ]
     
     def obs_process_fn(obs):
         # =====================================================================
@@ -239,9 +244,14 @@ def create_obs_process_fn(env_id: str, output_format: str = "NCHW") -> Callable:
         
         if "sensor_data" in obs:
             img_dict = obs["sensor_data"]
+            camera_items = [
+                (name, img_dict[name])
+                for name in camera_names
+                if name in img_dict
+            ] if camera_names else list(img_dict.items())
             
             # Process RGB
-            rgb_list = [v["rgb"] for v in img_dict.values() if "rgb" in v]
+            rgb_list = [v["rgb"] for _, v in camera_items if "rgb" in v]
             if rgb_list:
                 rgb_nhwc = np.concatenate(rgb_list, axis=-1)  # (T, H, W, 3*num_cameras)
                 if output_format == "NCHW":
@@ -250,7 +260,7 @@ def create_obs_process_fn(env_id: str, output_format: str = "NCHW") -> Callable:
                     rgb = rgb_nhwc
             
             # Process Depth
-            depth_list = [v["depth"] for v in img_dict.values() if "depth" in v]
+            depth_list = [v["depth"] for _, v in camera_items if "depth" in v]
             if depth_list:
                 depth_nhwc = np.concatenate(depth_list, axis=-1)  # (T, H, W, 1*num_cameras)
                 if output_format == "NCHW":
@@ -304,6 +314,18 @@ def load_carm_episode(filepath: str) -> Dict[str, np.ndarray]:
             data = {}
             with File(filepath, 'r') as f:
                 obs = f['observations']
+                required_obs_keys = ['images', 'qpos_joint', 'qpos_end', 'gripper', 'timestamps']
+                missing_obs_keys = [key for key in required_obs_keys if key not in obs]
+                if missing_obs_keys:
+                    raise ValueError(
+                        f"{os.path.basename(filepath)} missing required observation keys: {missing_obs_keys}"
+                    )
+                timestamp_semantics = f.attrs.get('timestamp_semantics', None)
+                if timestamp_semantics is not None and timestamp_semantics != 'obs_stamp_ros':
+                    print(
+                        f"WARNING: {os.path.basename(filepath)} has timestamp_semantics={timestamp_semantics!r}; "
+                        "expected 'obs_stamp_ros' for current CARM contract"
+                    )
                 data['images'] = np.array(obs['images'])
                 data['qpos_joint'] = np.array(obs['qpos_joint'])
                 data['qpos_end'] = np.array(obs['qpos_end'])
@@ -334,6 +356,7 @@ def load_carm_dataset(
     data_dir: str,
     num_episodes: Optional[int] = None,
     verbose: bool = True,
+    episode_paths: Optional[List[str]] = None,
 ) -> Dict[str, List[np.ndarray]]:
     """Load CARM dataset from directory containing HDF5 files.
     
@@ -346,9 +369,12 @@ def load_carm_dataset(
         Dictionary with lists of arrays for each data field
     """
     data_dir = os.path.expanduser(data_dir)
-    pattern = os.path.join(data_dir, "episode_*.hdf5")
-    files = sorted(glob.glob(pattern))
-    
+    if episode_paths is None:
+        pattern = os.path.join(data_dir, "episode_*.hdf5")
+        files = sorted(glob.glob(pattern))
+    else:
+        files = [os.path.expanduser(path) for path in episode_paths]
+
     if len(files) == 0:
         raise ValueError(f"No episode files found in {data_dir}")
     
@@ -365,6 +391,7 @@ def load_carm_dataset(
         'gripper': [],
         'timestamps': [],
         'action': [],
+        'teleop_scale': [],
     }
     
     iterator = tqdm(files, desc="Loading episodes") if verbose else files
@@ -377,6 +404,11 @@ def load_carm_dataset(
         dataset['gripper'].append(episode['gripper'])
         dataset['timestamps'].append(episode['timestamps'])
         
+        if 'teleop_scale' in episode:
+            dataset['teleop_scale'].append(episode['teleop_scale'])
+        else:
+            dataset['teleop_scale'].append(None)
+
         if 'action' in episode:
             dataset['action'].append(episode['action'])
     

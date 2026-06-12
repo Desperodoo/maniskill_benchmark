@@ -1,4 +1,4 @@
-prefix=/home/amax/maniskill_benchmark/carm_ros_deploy/devel
+prefix=/home/amax/rl-vla/carm_ros_deploy/devel
 
 Name: realsense2_description
 Description: Description of realsense2_description
